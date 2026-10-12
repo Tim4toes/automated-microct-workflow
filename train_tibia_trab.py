@@ -156,7 +156,7 @@ train_transform = A.Compose([
     A.GridDistortion(p=0.5),
 
     # Pad to square after warping to prevent border artifacts
-    A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
+    A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0),
 
     # 2D textural augmentations 
     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
@@ -170,7 +170,7 @@ train_transform = A.Compose([
 val_transform = A.Compose([
     # Ensure validation scans receive the exact same proportional downscale and padding
     A.LongestMaxSize(max_size=960, interpolation=cv2.INTER_AREA),
-    A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
+    A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0),
     
     A.Normalize(mean=[0.0526], std=[0.0955], max_pixel_value=255.0), 
     ToTensorV2(),
