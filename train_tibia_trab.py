@@ -147,22 +147,23 @@ class BoneDataset(Dataset):
 train_transform = A.Compose([
     # 1. Scale longest side to 960 and pad the missing space with black pixels
     A.LongestMaxSize(max_size=960, interpolation=cv2.INTER_AREA),
-    A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
 
-    # Original spatial augmentations
-    A.Rotate(limit=35, p=0.8, interpolation=cv2.INTER_NEAREST),
+    # Spatial augmentations
+    A.Rotate(limit=35, p=0.8),
     A.HorizontalFlip(p=0.5),
-
     # Shape-warping to prevent rigid morphology overfitting
-    A.ElasticTransform(alpha=1, sigma=50, p=0.5, interpolation=cv2.INTER_NEAREST),
-    A.GridDistortion(p=0.5, interpolation=cv2.INTER_NEAREST),
+    A.ElasticTransform(alpha=1, sigma=50, p=0.5),
+    A.GridDistortion(p=0.5),
+
+    # Pad to square after warping to prevent border artifacts
+    A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
 
     # 2D textural augmentations 
     A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
     A.GaussNoise(std_range=(0.01, 0.03), p=0.5),
     
     # Dataset Z-Score normalisation
-    A.Normalize(mean=[0.0330], std=[0.0726], max_pixel_value=255.0), 
+    A.Normalize(mean=[0.0526], std=[0.0955], max_pixel_value=255.0), 
     ToTensorV2(),
 ])
 
@@ -171,7 +172,7 @@ val_transform = A.Compose([
     A.LongestMaxSize(max_size=960, interpolation=cv2.INTER_AREA),
     A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
     
-    A.Normalize(mean=[0.0330], std=[0.0726], max_pixel_value=255.0), 
+    A.Normalize(mean=[0.0526], std=[0.0955], max_pixel_value=255.0), 
     ToTensorV2(),
 ])
 
@@ -319,6 +320,10 @@ def calculate_metrics(pred_logits, true_masks):
 # need to execute a single terminal command to handle training, testing, and logging.
 # =============================================================================
 def train_tibia(run_mode, epochs, model_path, images_base, masks_base, csv_path):
+    # Ensure save directories exist to prevent FileNotFoundError
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = UNet().to(device)
     
@@ -328,7 +333,8 @@ def train_tibia(run_mode, epochs, model_path, images_base, masks_base, csv_path)
     
     if run_mode in ["resume", "finetune"] and os.path.exists(model_path):
         print(f"\nLoading checkpoint for {run_mode.upper()} mode...")
-        checkpoint = torch.load(model_path)
+        # Added weights_only=False for PyTorch 2.4+ compatibility
+        checkpoint = torch.load(model_path, weights_only=False)
         
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -370,24 +376,16 @@ def train_tibia(run_mode, epochs, model_path, images_base, masks_base, csv_path)
     train_dataset = BoneDataset(train_folders, masks_base, transform=train_transform)
     val_dataset = BoneDataset(val_folders, masks_base, transform=val_transform)
 
-    # CRITICAL OPTIMIZATION: num_workers reduced to 2 for train, 1 for val to prevent 16GB RAM crash
-    # --- RAM OPTIMIZATION FIX ---
-    # Kept num_workers low for system stability, but explicitly restricted prefetch_factor to 2.
-    # This prevents the CPU from aggressively caching too many batches ahead of time, saving RAM.
     train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True, num_workers=10, pin_memory=True, persistent_workers=True, prefetch_factor=3)
     val_loader = DataLoader(val_dataset, batch_size=5, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=3)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+ 
     criterion = BCEDiceLoss() 
-    scaler = torch.amp.GradScaler('cuda') 
     
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5 
     )
     
-    best_loss = float('inf')
-    
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         current_lr = optimizer.param_groups[0]['lr']
         print(f"\n--- Epoch {epoch+1}/{epochs} | Current LR: {current_lr:.2e} ---")
         
@@ -533,7 +531,7 @@ if __name__ == "__main__":
         "--target", 
         type=str, 
         required=True, 
-        choices=["tibia", "cortical", "trabecular"],
+        choices=["tibia", "cortical", "trabecular", "parietal", "ossicle"],
         help="Select the biological target to segment."
     )
     
@@ -564,6 +562,19 @@ if __name__ == "__main__":
         images_base = "data/tibia_trab/images"
         masks_base = "data/tibia_trab/masks"
         csv_path = "logs/metrics_tibia_trabecular.csv"
+        
+    # --- NEW CRANIAL & OSSICLE TARGETS ---
+    elif args.target == "parietal":
+        model_path = "checkpoints/parietal_unet.pth"
+        images_base = "data/parietal_bone/images"
+        masks_base = "data/parietal_bone/masks"
+        csv_path = "logs/metrics_parietal.csv"
+        
+    elif args.target == "ossicle":
+        model_path = "checkpoints/ossicle_unet.pth"
+        images_base = "data/auditory_ossicles/images"
+        masks_base = "data/auditory_ossicles/masks"
+        csv_path = "logs/metrics_ossicles.csv"
 
     print(f"--- INITIALIZING PIPELINE ---")
     print(f"Target: {args.target.upper()}")
