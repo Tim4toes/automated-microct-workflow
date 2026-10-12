@@ -309,6 +309,18 @@ if __name__ == "__main__":
         default_input = "data/inference/input_tibia_trab"       
         default_output = "data/inference/output_tibia_trab" 
 
+        # --- NEW CRANIAL & OSSICLE TARGETS ---
+    elif args.target == "parietal":
+        model_path = "checkpoints/parietal_unet.pth"
+        images_base = "data/inference/input_parietal"
+        masks_base = "data/inference/output_parietal"
+        
+    elif args.target == "ossicle":
+        model_path = "checkpoints/ossicle_unet.pth"
+        images_base = "data/inference/input_auditory_ossicles"
+        masks_base = "data/inference/output_auditory_ossicles"
+        csv_path = "logs/metrics_ossicles.csv"
+
     # 2. Override defaults if external paths were provided in the terminal
     input_dir = args.input if args.input else default_input
     output_dir = args.output if args.output else default_output
