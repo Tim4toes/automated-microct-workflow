@@ -96,10 +96,10 @@ def generate_rois(model_weights_path, input_dir, output_dir):
     infer_transform = A.Compose([
         # 1. Scale longest side to 960 and pad the missing space with black pixels
         A.LongestMaxSize(max_size=960, interpolation=cv2.INTER_AREA),
-        A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, value=0),
+        A.PadIfNeeded(min_height=960, min_width=960, border_mode=cv2.BORDER_CONSTANT, fill=0),
         
         # 2. Apply global grayscale Z-score normalization and convert to PyTorch tensor
-        A.Normalize(mean=[0.0330], std=[0.0726], max_pixel_value=255.0),
+        A.Normalize(mean=[0.0526], std=[0.0955], max_pixel_value=255.0),
         ToTensorV2(),
     ])
 
@@ -242,14 +242,14 @@ def generate_rois(model_weights_path, input_dir, output_dir):
             # 3. Crop the artificial black borders off the predicted 960x960 slice
             cropped_slice = slice_2d[pad_y : pad_y + scaled_h, pad_x : pad_x + scaled_w]
             
-            # 4. Resize the cropped prediction back to the native dimensions
-            final_roi = cv2.resize(cropped_slice, (orig_width, orig_height), interpolation=cv2.INTER_NEAREST)
+            # 4. Resize using CUBIC interpolation to perfectly center the mask and eliminate the rightward shift
+            final_roi = cv2.resize(cropped_slice, (orig_width, orig_height), interpolation=cv2.INTER_CUBIC)
             
-            # 2D Median blur to smooth jagged edges without creating gray pixels
-            final_roi = cv2.medianBlur(final_roi, 3)
+            # 5. Snap the smooth anti-aliased edges back to strict 0 and 255 binary to ensure CTAn compatibility
+            final_roi = (final_roi > 127).astype(np.uint8) * 255
             
-            # Save strictly as 1-bit monochrome
-            Image.fromarray(final_roi).convert('1').save(str(out_paths[z]))
+            # Save as 8-bit grayscale with strictly binary 0 and 255 values
+            cv2.imwrite(str(out_paths[z]), final_roi)
 
         # Append the successfully processed folder to our tracking list
         cleaned_volumes_list.append(folder.name)    
@@ -272,7 +272,7 @@ if __name__ == "__main__":
         "--target", 
         type=str, 
         required=True, 
-        choices=["tibia", "cortical", "trabecular"],
+        choices=["tibia", "cortical", "trabecular", "parietal", "ossicle"],
         help="Select the biological target to segment."
     )
     
@@ -289,7 +289,7 @@ if __name__ == "__main__":
         type=str, 
         default=None,
         help="Optional: Override the default output directory with an external path."
-    )
+    )  
     
     args = parser.parse_args()
     
@@ -309,17 +309,16 @@ if __name__ == "__main__":
         default_input = "data/inference/input_tibia_trab"       
         default_output = "data/inference/output_tibia_trab" 
 
-        # --- NEW CRANIAL & OSSICLE TARGETS ---
+    # --- NEW CRANIAL & OSSICLE TARGETS ---
     elif args.target == "parietal":
-        model_path = "checkpoints/parietal_unet.pth"
-        images_base = "data/inference/input_parietal"
-        masks_base = "data/inference/output_parietal"
+        model_weights_path = "checkpoints/parietal_unet.pth"
+        default_input = "data/inference/input_parietal"
+        default_output = "data/inference/output_parietal"
         
     elif args.target == "ossicle":
-        model_path = "checkpoints/ossicle_unet.pth"
-        images_base = "data/inference/input_auditory_ossicles"
-        masks_base = "data/inference/output_auditory_ossicles"
-        csv_path = "logs/metrics_ossicles.csv"
+        model_weights_path = "checkpoints/ossicle_unet.pth"
+        default_input = "data/inference/input_auditory_ossicles"
+        default_output = "data/inference/output_auditory_ossicles"
 
     # 2. Override defaults if external paths were provided in the terminal
     input_dir = args.input if args.input else default_input
