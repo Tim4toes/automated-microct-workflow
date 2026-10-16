@@ -21,7 +21,7 @@ from skimage import measure
 from torch.utils.data import Dataset, DataLoader
 
 # Import your U-Net architecture from the master grayscale training script
-from train_tibia import UNet 
+from train_bone_model import UNet 
 
 # =============================================================================
 # --- 1. DATASET & DATALOADER (32GB RAM OPTIMISED) ---
