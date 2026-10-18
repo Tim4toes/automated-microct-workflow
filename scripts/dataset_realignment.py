@@ -282,3 +282,31 @@ if __name__ == "__main__":
             print(f"ERROR processing {skull_name}: {e}")
 
     print("\nBatch alignment pipeline complete.")
+
+# =============================================================================
+# --- HOW TO RUN DIFFERENT REALIGNMENT BATCHES ---
+# Open your terminal (CMD or PowerShell) and navigate to the scripts directory.
+# 
+# Then execute one of the following commands:
+#
+# 1 - Running the default batch (Adult Skull Atlas, Dynamic Z):
+# python batch_dataset_realignment.py
+#
+# 2 - Realigning a different bone (e.g., Tibia) from a specific external drive:
+# python batch_dataset_realignment.py --atlas "F:/automated-microct-workflow/1_reference_files/atlast_library/Tibia_Left" --input "D:/External_Drive/Tibia_Project" --mode 1
+#
+# 3 - Forcing strict cropping (Mode 2) to match Atlas slice count exactly:
+# python batch_dataset_realignment.py --input "E:/External_Drive/Mouse_Skulls_Project" --mode 2
+#
+# --- WHAT THE MODES DO ---
+# --mode 1 (Dynamic Z - Recommended): 
+# Mathematically rotates the target into the Atlas coordinate space, but dynamically 
+# calculates the new physical bounding box to ensure 0% of the target bone is cropped. 
+# Resulting folders will have different .bmp file counts depending on physical bone length.
+#
+# --mode 2 (Atlas BBox): 
+# Strict conformity. Forces the realigned target to adopt the exact bounding box of 
+# the Atlas. Any part of the target bone extending past the Atlas boundaries is 
+# permanently cropped. Useful only if your downstream pipeline strictly requires 
+# identically sized tensors across all samples.
+# =============================================================================
