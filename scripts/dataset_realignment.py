@@ -11,6 +11,7 @@ import numpy as np
 import SimpleITK as sitk
 import datetime
 import math
+import argparse
 
 # =============================================================================
 # --- 1. DATA I/O (LOADING & SAVING) ---
@@ -207,28 +208,74 @@ def resample_dataset(target_img, atlas_img, transform, mode):
 
 # =============================================================================
 # --- 5. MAIN BATCH LOOP & TERMINAL PARSER ---
-# WHAT IT DOES: Scans the external drive for mouse skull subfolders. It loads the 
-# reference Atlas into memory exactly once, then iteratively searches each subfolder 
-# for a "recon" directory. It rigidly aligns the unaligned reconstruction, outputs 
-# the new .bmp stack to an adjacent "realigned" directory, and injects the updated 
-# Bruker metadata log.
-# WHY IT IS NEEDED: Automates high-throughput processing. Because the Atlas is loaded 
-# only once, and errors are caught without crashing the script, this loop can process 
-# hundreds of datasets overnight entirely hands-free via the command line.
+# WHAT IT DOES: Scans the specified external drive for sample subfolders. It loads 
+# the chosen reference Atlas into memory exactly once, then iteratively searches 
+# each subfolder for a "recon" directory. It rigidly aligns the unaligned reconstruction, 
+# outputs the new .bmp stack to an adjacent "realigned" directory, and injects 
+# the updated Bruker metadata log.
+# WHY IT IS NEEDED: Automates high-throughput processing and streamlines the workflow. 
+# By intercepting console commands, it allows you to dynamically assign input/output 
+# directories and select the biological target directly from the terminal prompt, 
+# without ever having to manually open and edit the Python script.
 # =============================================================================
 if __name__ == "__main__":
-    import argparse
+    
     parser = argparse.ArgumentParser(description="Automated 3D Rigid MicroCT Registration")
-    parser.add_argument("--atlas", type=str, default="F:/automated-microct-workflow/1_reference_files/atlast_library/Skull_Adult", help="Path to reference atlas folder")
-    parser.add_argument("--input", type=str, default="E:/External_Drive/Mouse_Skulls_Project", help="Path to main directory containing sample subfolders")
-    parser.add_argument("--mode", type=int, default=1, choices=[1, 2], help="1=Dynamic Z (preserves length), 2=Atlas BBox (strict crop)")
+    
+    # Require the biological target to be specified to automatically route to the correct Atlas
+    parser.add_argument(
+        "--target", 
+        type=str, 
+        required=True, 
+        choices=["skull", "tibia_left", "tibia_right", "femur_left", "femur_right"],
+        help="Select the biological target to route to the correct Atlas."
+    )
+    
+    # Require the input directory path
+    parser.add_argument(
+        "--input", 
+        type=str, 
+        required=True,
+        help="Path to the main external directory containing sample subfolders."
+    )
+    
+    # Optional mode override
+    parser.add_argument(
+        "--mode", 
+        type=int, 
+        default=1, 
+        choices=[1, 2], 
+        help="1=Dynamic Z (preserves length), 2=Atlas BBox (strict crop)."
+    )
+    
     args = parser.parse_args()
 
-    ATLAS_DIR = args.atlas
+    # 1. Establish the default Atlas paths based on the chosen target
+    base_atlas_dir = "F:/automated-microct-workflow/1_reference_files/atlast_library"
+    
+    if args.target == "skull":
+        ATLAS_DIR = os.path.join(base_atlas_dir, "Skull_Adult")
+    elif args.target == "tibia_left":
+        ATLAS_DIR = os.path.join(base_atlas_dir, "Tibia_Left")
+    elif args.target == "tibia_right":
+        ATLAS_DIR = os.path.join(base_atlas_dir, "Tibia_Right")
+    elif args.target == "femur_left":
+        ATLAS_DIR = os.path.join(base_atlas_dir, "Femur_Left")
+    elif args.target == "femur_right":
+        ATLAS_DIR = os.path.join(base_atlas_dir, "Femur_Right")
+
     MAIN_DATA_DIR = args.input
     OUTPUT_MODE = args.mode
 
     print(f"--- INITIALIZING AUTOMATED REGISTRATION PIPELINE ---")
+    print(f"Target: {args.target.upper()}")
+    print(f"Input Directory: {MAIN_DATA_DIR}")
+    print(f"Mode: {'Dynamic Z (Preserve Length)' if OUTPUT_MODE == 1 else 'Atlas Bounding Box (Strict Crop)'}")
+    
+    if not os.path.exists(ATLAS_DIR):
+        print(f"\nCRITICAL ERROR: Atlas directory not found at {ATLAS_DIR}. Please ensure your library is set up.")
+        exit()
+
     print(f"Loading Atlas into memory from {ATLAS_DIR}...")
     atlas = load_bmp_stack(ATLAS_DIR)
     
@@ -287,19 +334,19 @@ if __name__ == "__main__":
 # --- HOW TO RUN DIFFERENT REALIGNMENT BATCHES ---
 # Open your terminal (CMD or PowerShell) and navigate to the scripts directory.
 # 
-# Then execute one of the following commands:
+# The script requires two mandatory arguments: --target and --input.
+# 
+# 1 - Realigning Mouse Skulls on Drive E (using Default Dynamic Z mode):
+# python batch_dataset_realignment.py --target skull --input "E:/External_Drive/Mouse_Skulls_Project"
 #
-# 1 - Running the default batch (Adult Skull Atlas, Dynamic Z):
-# python batch_dataset_realignment.py
+# 2 - Realigning Left Tibias on Drive D:
+# python batch_dataset_realignment.py --target tibia_left --input "D:/External_Drive/Tibia_Project"
 #
-# 2 - Realigning a different bone (e.g., Tibia) from a specific external drive:
-# python batch_dataset_realignment.py --atlas "F:/automated-microct-workflow/1_reference_files/atlast_library/Tibia_Left" --input "D:/External_Drive/Tibia_Project" --mode 1
-#
-# 3 - Forcing strict cropping (Mode 2) to match Atlas slice count exactly:
-# python batch_dataset_realignment.py --input "E:/External_Drive/Mouse_Skulls_Project" --mode 2
+# 3 - Realigning Right Femurs and forcing strict cropping (Mode 2):
+# python batch_dataset_realignment.py --target femur_right --input "D:/External_Drive/Femur_Project" --mode 2
 #
 # --- WHAT THE MODES DO ---
-# --mode 1 (Dynamic Z - Recommended): 
+# --mode 1 (Dynamic Z - Default & Recommended): 
 # Mathematically rotates the target into the Atlas coordinate space, but dynamically 
 # calculates the new physical bounding box to ensure 0% of the target bone is cropped. 
 # Resulting folders will have different .bmp file counts depending on physical bone length.
