@@ -1,6 +1,12 @@
 # Ignore the data folders and all images/masks inside them
 data/
 
+1_reference_files/
+2_model_training_data/
+3_workflow/
+
+
+
 # Ignore the virtual environment
 venv/
 
