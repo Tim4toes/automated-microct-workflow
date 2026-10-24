@@ -53,6 +53,7 @@ last_add_pt = None
 live_dilation_iters = 0     
 export_dilation_iters = 1   
 params_locked = True
+persistent_edits = False    # Toggles automatic carry-over of cuts/bridges
 
 # Rendering variables
 needs_redraw = True
@@ -149,6 +150,13 @@ def load_current_image(propagate_from=None):
     image_name = image_files[current_idx]
     img = cv2.imread(os.path.join(input_dir, image_name), cv2.IMREAD_GRAYSCALE)
     
+    # Clone cuts and bridges from the previous slice if Persistent Mode is ON
+    if persistent_edits and propagate_from is not None:
+        if propagate_from in slice_cuts and current_idx not in slice_cuts:
+            slice_cuts[current_idx] = slice_cuts[propagate_from].copy()
+        if propagate_from in slice_adds and current_idx not in slice_adds:
+            slice_adds[current_idx] = slice_adds[propagate_from].copy()
+            
     user_cuts = slice_cuts.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     user_adds = slice_adds.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     
@@ -272,6 +280,7 @@ controls_data = [
     ("'j' / 'h' Keys", "Next / Previous image (Auto-propagates)"),
     ("", ""),
     ("'u'", "Undo SCALPEL & BRIDGES only on this slice"),
+    ("'p'", "Toggle PERSISTENT edits (auto-copy to next slice)"),
     ("'c'", "Clear BOTH selections and cuts on this slice"),
     ("'r'", "Reset camera zoom and pan"),
     ("'m'", "Toggle Pure Mask View"),
@@ -343,8 +352,7 @@ while True:
     text_color_1 = (0, 0, 255) if has_active_edits else (255, 255, 255)
 
     status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
-    status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked}"
-    
+    status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked} | Persist: {'ON' if persistent_edits else 'OFF'}"
     cv2.putText(view, status_1, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color_1, 1)
     cv2.putText(view, status_2, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if params_locked else (255, 255, 255), 1)
 
@@ -443,6 +451,9 @@ while True:
     elif key == ord("m"):
         pure_mask_view = not pure_mask_view
         needs_redraw = True
+    elif key == ord("p"):
+        persistent_edits = not persistent_edits
+        needs_redraw = True    
     elif key == ord("c"):
         selected_labels.clear()
         user_cuts.fill(0)
