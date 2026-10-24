@@ -104,16 +104,20 @@ def get_overlapping_labels(target_labels_array, reference_mask):
 def generate_raw_components(image_array, cuts_array, adds_array):
     _, thresh = cv2.threshold(image_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
+    # 1. Apply user bridges FIRST, closing outer gaps before contour detection
+    thresh[adds_array > 0] = 255
+    
     if live_dilation_iters > 0:
         kernel = np.ones((3, 3), np.uint8)
         thresh = cv2.dilate(thresh, kernel, iterations=live_dilation_iters)
     
+    # 2. Find external contours. Because gaps are now bridged, internal holes will be filled automatically.
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(thresh)
     cv2.drawContours(filled, contours, -1, 255, -1)
     
-    filled[adds_array > 0] = 255  # Fill gaps manually drawn by user
-    filled[cuts_array > 0] = 0    # Scalpel cuts take strict precedence
+    # 3. Apply scalpel cuts LAST so they cleanly sever the filled bone segments
+    filled[cuts_array > 0] = 0    
     return cv2.connectedComponents(filled, connectivity=4)
 
 def update_approved_mask():
@@ -316,19 +320,28 @@ while True:
                 blended_red = cv2.addWeighted(display_img, 0.8, red_overlay, 0.2, 0)
                 display_img[combined_mask > 0] = blended_red[combined_mask > 0]
 
+            # 20% Opacity Green for Bridge Lines
             if np.any(user_adds > 0):
-                display_img[user_adds > 0] = [0, 255, 0]  # Green for bridges
+                add_overlay = display_img.copy()
+                add_overlay[user_adds > 0] = [0, 255, 0]
+                blended_add = cv2.addWeighted(display_img, 0.8, add_overlay, 0.2, 0)
+                display_img[user_adds > 0] = blended_add[user_adds > 0]
 
+            # 20% Opacity White for Scalpel Cuts
             if np.any(user_cuts > 0):
-                display_img[user_cuts > 0] = [255, 255, 255]  # White for scalpels
+                cut_overlay = display_img.copy()
+                cut_overlay[user_cuts > 0] = [255, 255, 255]
+                blended_cut = cv2.addWeighted(display_img, 0.8, cut_overlay, 0.2, 0)
+                display_img[user_cuts > 0] = blended_cut[user_cuts > 0]
 
         needs_redraw = False
 
     M = np.array([[zoom_level, 0, -view_x * zoom_level], [0, zoom_level, -view_y * zoom_level]], dtype=np.float32)
     view = cv2.warpAffine(display_img, M, (VIEW_W, VIEW_H), flags=cv2.INTER_NEAREST)
 
-    text_color_1 = (0, 0, 255) if (np.any(user_cuts > 0) or np.any(user_adds > 0)) else (255, 255, 255)
-    
+    has_active_edits = (current_idx in slice_cuts) or (current_idx in slice_adds) or drawing_cut or drawing_add
+    text_color_1 = (0, 0, 255) if has_active_edits else (255, 255, 255)
+
     status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
     status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked}"
     
@@ -350,11 +363,14 @@ while True:
         os.makedirs(output_dir, exist_ok=True)
         last_valid_mask = None
         
+        # Pre-allocate static arrays outside the loop to vastly improve speed
+        empty_mask = np.zeros(IMAGE_SHAPE, dtype=np.uint8)
+        export_kernel = np.ones((3, 3), np.uint8) if export_dilation_iters > 0 else None
+        
         for i in range(len(image_files)):
             out_path = os.path.join(output_dir, os.path.splitext(image_files[i])[0] + ".bmp")
             
             if i < z_min or i > z_max:
-                empty_mask = np.zeros(IMAGE_SHAPE, dtype=np.uint8)
                 Image.fromarray(empty_mask).convert('1').save(out_path)
                 continue
                 
@@ -367,13 +383,12 @@ while True:
                 _, temp_labels = generate_raw_components(temp_img, c_array, a_array)
                 temp_sel = get_overlapping_labels(temp_labels, last_valid_mask)
                 raw_mask = (np.isin(temp_labels, list(temp_sel)) * 255).astype(np.uint8)
-                slice_approved_masks[i] = raw_mask
+                # CRITICAL: Do NOT save raw_mask to slice_approved_masks here, or RAM will explode
             
             last_valid_mask = raw_mask.copy()
             
-            if export_dilation_iters > 0:
-                kernel = np.ones((3, 3), np.uint8)
-                last_valid_mask = cv2.dilate(last_valid_mask, kernel, iterations=export_dilation_iters)
+            if export_kernel is not None:
+                last_valid_mask = cv2.dilate(last_valid_mask, export_kernel, iterations=export_dilation_iters)
                 
             Image.fromarray(last_valid_mask).convert('1').save(out_path)
             if i % 50 == 0:
@@ -398,6 +413,11 @@ while True:
                 current_idx = 0
                 z_min = 0
                 z_max = len(image_files) - 1
+
+                # prevent cross-contamination between datasets
+                slice_cuts.clear()
+                slice_adds.clear()
+                slice_approved_masks.clear()
                 
                 load_current_image()
                 print(f"\n--- Switched to Dataset: {dataset_name} ---")
