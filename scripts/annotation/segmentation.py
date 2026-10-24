@@ -32,6 +32,7 @@ z_min = 0
 z_max = len(image_files) - 1
 
 slice_cuts = {}            
+slice_adds = {}
 slice_approved_masks = {}  
 
 # State variables for active slice segmentation
@@ -39,9 +40,14 @@ labels = None
 num_labels = 0
 selected_labels = set()
 user_cuts = None
+user_adds = None
 pure_mask_view = False
+
+# Drawing state
 drawing_cut = False
 last_cut_pt = None
+drawing_add = False
+last_add_pt = None
 
 # Interactive parameters
 live_dilation_iters = 0     
@@ -58,6 +64,33 @@ view_x, view_y = 0.0, 0.0
 is_panning = False
 last_pan_pt = None
 
+# --- Workspace Management ---
+
+def save_workspace():
+    os.makedirs(output_dir, exist_ok=True)
+    session_file = os.path.join(output_dir, f"{dataset_name}_workspace.npz")
+    save_dict = {}
+    for k, v in slice_cuts.items(): save_dict[f"cut_{k}"] = v
+    for k, v in slice_adds.items(): save_dict[f"add_{k}"] = v
+    for k, v in slice_approved_masks.items(): save_dict[f"mask_{k}"] = v
+    np.savez_compressed(session_file, **save_dict)
+    print(f"\n--- Workspace successfully saved to {session_file} ---")
+
+def load_workspace():
+    global slice_cuts, slice_adds, slice_approved_masks
+    slice_cuts.clear()
+    slice_adds.clear()
+    slice_approved_masks.clear()
+    session_file = os.path.join(output_dir, f"{dataset_name}_workspace.npz")
+    if os.path.exists(session_file):
+        data = np.load(session_file)
+        for key in data.files:
+            idx = int(key.split('_')[1])
+            if key.startswith("cut_"): slice_cuts[idx] = data[key]
+            elif key.startswith("add_"): slice_adds[idx] = data[key]
+            elif key.startswith("mask_"): slice_approved_masks[idx] = data[key]
+        print(f"\n--- Loaded existing workspace for '{dataset_name}' ---")
+
 # --- Core Segmentation Logic ---
 
 def get_overlapping_labels(target_labels_array, reference_mask):
@@ -68,7 +101,7 @@ def get_overlapping_labels(target_labels_array, reference_mask):
     unique_labels.discard(0) 
     return unique_labels
 
-def generate_raw_components(image_array, cuts_array):
+def generate_raw_components(image_array, cuts_array, adds_array):
     _, thresh = cv2.threshold(image_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     if live_dilation_iters > 0:
@@ -79,7 +112,8 @@ def generate_raw_components(image_array, cuts_array):
     filled = np.zeros_like(thresh)
     cv2.drawContours(filled, contours, -1, 255, -1)
     
-    filled[cuts_array > 0] = 0
+    filled[adds_array > 0] = 255  # Fill gaps manually drawn by user
+    filled[cuts_array > 0] = 0    # Scalpel cuts take strict precedence
     return cv2.connectedComponents(filled, connectivity=4)
 
 def update_approved_mask():
@@ -96,7 +130,7 @@ def invalidate_future_caches():
 
 def recompute_components(auto_select_from_mask=None):
     global labels, num_labels, selected_labels, needs_redraw
-    num_labels, labels = generate_raw_components(img, user_cuts)
+    num_labels, labels = generate_raw_components(img, user_cuts, user_adds)
     
     if auto_select_from_mask is not None:
         selected_labels = get_overlapping_labels(labels, auto_select_from_mask)
@@ -107,11 +141,12 @@ def recompute_components(auto_select_from_mask=None):
     needs_redraw = True
 
 def load_current_image(propagate_from=None):
-    global img, image_name, user_cuts, selected_labels
+    global img, image_name, user_cuts, user_adds, selected_labels
     image_name = image_files[current_idx]
     img = cv2.imread(os.path.join(input_dir, image_name), cv2.IMREAD_GRAYSCALE)
     
     user_cuts = slice_cuts.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
+    user_adds = slice_adds.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     
     ref_mask = None
     if current_idx in slice_approved_masks:
@@ -138,7 +173,7 @@ def screen_to_img(x, y):
     return max(0, min(ix, img.shape[1] - 1)), max(0, min(iy, img.shape[0] - 1))
 
 def mouse_click(event, x, y, flags, param):
-    global drawing_cut, last_cut_pt, is_panning, last_pan_pt
+    global drawing_cut, last_cut_pt, drawing_add, last_add_pt, is_panning, last_pan_pt
     global zoom_level, view_x, view_y, needs_redraw
 
     ix, iy = screen_to_img(x, y)
@@ -173,20 +208,38 @@ def mouse_click(event, x, y, flags, param):
             needs_redraw = True
 
     elif event == cv2.EVENT_RBUTTONDOWN:
-        drawing_cut = True
-        last_cut_pt = (ix, iy)
-        user_cuts[iy, ix] = 255  
+        if flags & cv2.EVENT_FLAG_SHIFTKEY:
+            drawing_add = True
+            last_add_pt = (ix, iy)
+            user_adds[iy, ix] = 255
+        else:
+            drawing_cut = True
+            last_cut_pt = (ix, iy)
+            user_cuts[iy, ix] = 255  
         needs_redraw = True
-    elif event == cv2.EVENT_MOUSEMOVE and drawing_cut:
-        if last_cut_pt is not None:
+        
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if drawing_cut and last_cut_pt is not None:
             cv2.line(user_cuts, last_cut_pt, (ix, iy), 255, thickness=1)
             last_cut_pt = (ix, iy)
             needs_redraw = True
+        elif drawing_add and last_add_pt is not None:
+            cv2.line(user_adds, last_add_pt, (ix, iy), 255, thickness=1)
+            last_add_pt = (ix, iy)
+            needs_redraw = True
+            
     elif event == cv2.EVENT_RBUTTONUP:
-        drawing_cut = False
-        last_cut_pt = None
-        if np.any(user_cuts > 0):
-            slice_cuts[current_idx] = user_cuts.copy()
+        if drawing_cut:
+            drawing_cut = False
+            last_cut_pt = None
+            if np.any(user_cuts > 0):
+                slice_cuts[current_idx] = user_cuts.copy()
+        if drawing_add:
+            drawing_add = False
+            last_add_pt = None
+            if np.any(user_adds > 0):
+                slice_adds[current_idx] = user_adds.copy()
+                
         recompute_components()
         invalidate_future_caches()
 
@@ -199,6 +252,7 @@ controls_data = [
     ("", ""),
     ("Left Click", "Select / Unselect a bone plate"),
     ("Right Click & Drag", "Draw 'scalpel' line to sever a bridging suture"),
+    ("Shift + Right Click", "Draw 'bridge' line to fill gaps/connect bones"),
     ("Scroll Wheel", "Zoom in/out"),
     ("Middle Click & Drag", "Pan image"),
     ("", ""),
@@ -209,9 +263,11 @@ controls_data = [
     ("", ""),
     ("'e'", "BATCH EXPORT entire volume"),
     ("'s'", "SAVE CURRENT SINGLE SLICE only"),
+    ("'w'", "SAVE WORKSPACE (saves all cuts & memory)"),
+    ("'a'", "LOAD WORKSPACE (restores saved session)"),
     ("'j' / 'h' Keys", "Next / Previous image (Auto-propagates)"),
     ("", ""),
-    ("'u'", "Undo/Clear SCALPEL CUTS only on this slice"),
+    ("'u'", "Undo SCALPEL & BRIDGES only on this slice"),
     ("'c'", "Clear BOTH selections and cuts on this slice"),
     ("'r'", "Reset camera zoom and pan"),
     ("'m'", "Toggle Pure Mask View"),
@@ -220,43 +276,35 @@ controls_data = [
     ("'q'", "Quit")
 ]
 
-# Increased width to 650 to accommodate the table layout
-controls_img = np.zeros((680, 650, 3), dtype=np.uint8)
+controls_img = np.zeros((730, 650, 3), dtype=np.uint8)
 y_offset = 30
 
 for key_text, action_text in controls_data:
     if action_text == "":
-        # Draw headers or empty lines
         cv2.putText(controls_img, key_text, (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     else:
-        # Draw Column 1 (Keys) at x=15
         cv2.putText(controls_img, key_text, (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-        # Draw Column 2 (Actions) at x=210
-        cv2.putText(controls_img, action_text, (210, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-    
+        cv2.putText(controls_img, action_text, (230, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     y_offset += 25
 
 cv2.imshow("Controls Menu", controls_img)
 
 # Main Viewer Window
 window_name = "Volumetric CC Editor"
-# The KEEPRATIO flag prevents the image from skewing when the window is stretched
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
 cv2.resizeWindow(window_name, VIEW_W, VIEW_H)
 cv2.setMouseCallback(window_name, mouse_click)
 
 while True:
-    # 1. Exit cleanly if the user clicks the 'X' to close either window
     if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
         break
     if cv2.getWindowProperty("Controls Menu", cv2.WND_PROP_VISIBLE) < 1:
         break
 
-    # 2. Dynamically update the canvas size to match the live window dimensions (prevents skewing)
     rect = cv2.getWindowImageRect(window_name)
-
     if rect[2] > 0 and rect[3] > 0:
         VIEW_W, VIEW_H = rect[2], rect[3]
+
     if needs_redraw:
         if pure_mask_view:
             display_img = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
@@ -268,17 +316,18 @@ while True:
                 blended_red = cv2.addWeighted(display_img, 0.8, red_overlay, 0.2, 0)
                 display_img[combined_mask > 0] = blended_red[combined_mask > 0]
 
+            if np.any(user_adds > 0):
+                display_img[user_adds > 0] = [0, 255, 0]  # Green for bridges
+
             if np.any(user_cuts > 0):
-                white_scalpel = np.full_like(display_img, 255)
-                blended_scalpel = cv2.addWeighted(display_img, 0.8, white_scalpel, 0.2, 0)
-                display_img[user_cuts > 0] = blended_scalpel[user_cuts > 0]
+                display_img[user_cuts > 0] = [255, 255, 255]  # White for scalpels
+
         needs_redraw = False
 
     M = np.array([[zoom_level, 0, -view_x * zoom_level], [0, zoom_level, -view_y * zoom_level]], dtype=np.float32)
     view = cv2.warpAffine(display_img, M, (VIEW_W, VIEW_H), flags=cv2.INTER_NEAREST)
 
-    # Turn text RED (0, 0, 255) if a scalpel cut exists on the current slice
-    text_color_1 = (0, 0, 255) if np.any(user_cuts > 0) else (255, 255, 255)
+    text_color_1 = (0, 0, 255) if (np.any(user_cuts > 0) or np.any(user_adds > 0)) else (255, 255, 255)
     
     status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
     status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked}"
@@ -289,7 +338,14 @@ while True:
     cv2.imshow(window_name, view)
     key = cv2.waitKey(15) & 0xFF
 
-    if key == ord("e"):
+    if key == ord("w"):
+        save_workspace()
+
+    elif key == ord("a"):
+        load_workspace()
+        load_current_image()    
+        
+    elif key == ord("e"):
         print(f"\n--- Starting Batch Export (Slices {z_min+1} to {z_max+1}) ---")
         os.makedirs(output_dir, exist_ok=True)
         last_valid_mask = None
@@ -307,7 +363,8 @@ while True:
             else:
                 temp_img = cv2.imread(os.path.join(input_dir, image_files[i]), cv2.IMREAD_GRAYSCALE)
                 c_array = slice_cuts.get(i, np.zeros(IMAGE_SHAPE, dtype=np.uint8))
-                _, temp_labels = generate_raw_components(temp_img, c_array)
+                a_array = slice_adds.get(i, np.zeros(IMAGE_SHAPE, dtype=np.uint8))
+                _, temp_labels = generate_raw_components(temp_img, c_array, a_array)
                 temp_sel = get_overlapping_labels(temp_labels, last_valid_mask)
                 raw_mask = (np.isin(temp_labels, list(temp_sel)) * 255).astype(np.uint8)
                 slice_approved_masks[i] = raw_mask
@@ -341,8 +398,6 @@ while True:
                 current_idx = 0
                 z_min = 0
                 z_max = len(image_files) - 1
-                slice_cuts.clear()
-                slice_approved_masks.clear()
                 
                 load_current_image()
                 print(f"\n--- Switched to Dataset: {dataset_name} ---")
@@ -371,14 +426,16 @@ while True:
     elif key == ord("c"):
         selected_labels.clear()
         user_cuts.fill(0)
-        if current_idx in slice_cuts: 
-            del slice_cuts[current_idx]
+        user_adds.fill(0)
+        if current_idx in slice_cuts: del slice_cuts[current_idx]
+        if current_idx in slice_adds: del slice_adds[current_idx]
         recompute_components()
         invalidate_future_caches()
     elif key == ord("u"):
         user_cuts.fill(0)
-        if current_idx in slice_cuts:
-            del slice_cuts[current_idx]
+        user_adds.fill(0)
+        if current_idx in slice_cuts: del slice_cuts[current_idx]
+        if current_idx in slice_adds: del slice_adds[current_idx]
         recompute_components()
         invalidate_future_caches()
     elif key == ord("r"):
