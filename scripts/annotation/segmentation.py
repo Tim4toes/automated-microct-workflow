@@ -1,11 +1,18 @@
 import os
 import cv2
 import numpy as np
+import tkinter as tk
+from tkinter import filedialog
+from PIL import Image
 
-# 1. Define input and output directories
-input_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing"
-output_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks"
-os.makedirs(output_dir, exist_ok=True)
+# Hide the main tkinter window
+tk_root = tk.Tk()
+tk_root.withdraw()
+
+# 1. Define initial input directory
+input_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing\input_data\dataset1_sost"
+dataset_name = os.path.basename(os.path.normpath(input_dir))
+output_dir = os.path.join(r"F:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks", dataset_name)
 
 # 2. Discover images
 valid_exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
@@ -14,11 +21,20 @@ image_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(val
 if not image_files:
     raise FileNotFoundError(f"No images found in {input_dir}")
 
+sample_img = cv2.imread(os.path.join(input_dir, image_files[0]), cv2.IMREAD_GRAYSCALE)
+IMAGE_SHAPE = sample_img.shape
+
+# Volumetric & Memory State Variables
 current_idx = 0
 img = None
 image_name = ""
+z_min = 0
+z_max = len(image_files) - 1
 
-# State variables for segmentation
+slice_cuts = {}            
+slice_approved_masks = {}  
+
+# State variables for active slice segmentation
 labels = None
 num_labels = 0
 selected_labels = set()
@@ -28,22 +44,87 @@ drawing_cut = False
 last_cut_pt = None
 
 # Interactive parameters
-otsu_multiplier = 0.95
-live_dilation_iters = 0     # Affects the live thresholding and component bridging
-export_dilation_iters = 1   # Applied ONLY to the final saved mask
-params_locked = False
+live_dilation_iters = 0     
+export_dilation_iters = 1   
+params_locked = True
 
-# Rendering optimization
+# Rendering variables
 needs_redraw = True
 display_img = None
 combined_mask = None
-
-# Camera viewport variables (Zoom & Pan)
 VIEW_W, VIEW_H = 1400, 950
 zoom_level = 1.0
 view_x, view_y = 0.0, 0.0
 is_panning = False
 last_pan_pt = None
+
+# --- Core Segmentation Logic ---
+
+def get_overlapping_labels(target_labels_array, reference_mask):
+    if reference_mask is None:
+        return set()
+    overlapping_pixels = target_labels_array[reference_mask > 0]
+    unique_labels = set(np.unique(overlapping_pixels))
+    unique_labels.discard(0) 
+    return unique_labels
+
+def generate_raw_components(image_array, cuts_array):
+    _, thresh = cv2.threshold(image_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    if live_dilation_iters > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.dilate(thresh, kernel, iterations=live_dilation_iters)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(thresh)
+    cv2.drawContours(filled, contours, -1, 255, -1)
+    
+    filled[cuts_array > 0] = 0
+    return cv2.connectedComponents(filled, connectivity=4)
+
+def update_approved_mask():
+    global combined_mask
+    active_mask = np.isin(labels, list(selected_labels))
+    combined_mask = (active_mask * 255).astype(np.uint8)
+    slice_approved_masks[current_idx] = combined_mask.copy()
+
+def invalidate_future_caches():
+    future_keys = [k for k in slice_approved_masks if k > current_idx]
+    if future_keys:
+        for k in future_keys:
+            del slice_approved_masks[k]
+
+def recompute_components(auto_select_from_mask=None):
+    global labels, num_labels, selected_labels, needs_redraw
+    num_labels, labels = generate_raw_components(img, user_cuts)
+    
+    if auto_select_from_mask is not None:
+        selected_labels = get_overlapping_labels(labels, auto_select_from_mask)
+    else:
+        selected_labels = {l for l in selected_labels if l < num_labels}
+        
+    update_approved_mask()
+    needs_redraw = True
+
+def load_current_image(propagate_from=None):
+    global img, image_name, user_cuts, selected_labels
+    image_name = image_files[current_idx]
+    img = cv2.imread(os.path.join(input_dir, image_name), cv2.IMREAD_GRAYSCALE)
+    
+    user_cuts = slice_cuts.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
+    
+    ref_mask = None
+    if current_idx in slice_approved_masks:
+        ref_mask = slice_approved_masks[current_idx]
+    elif propagate_from is not None and propagate_from in slice_approved_masks:
+        ref_mask = slice_approved_masks[propagate_from]
+        
+    if propagate_from is None:
+        reset_view()
+        
+    recompute_components(auto_select_from_mask=ref_mask)
+
+# --- UI & Interaction ---
 
 def reset_view():
     global zoom_level, view_x, view_y
@@ -56,61 +137,30 @@ def screen_to_img(x, y):
     iy = int((y / zoom_level) + view_y)
     return max(0, min(ix, img.shape[1] - 1)), max(0, min(iy, img.shape[0] - 1))
 
-def recompute_components():
-    global labels, num_labels, selected_labels, needs_redraw
-    
-    otsu_val, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, thresh = cv2.threshold(img, otsu_val * otsu_multiplier, 255, cv2.THRESH_BINARY)
-    
-    # Apply LIVE dilation (affects what is clickable/merged on screen)
-    if live_dilation_iters > 0:
-        kernel = np.ones((3, 3), np.uint8)
-        thresh = cv2.dilate(thresh, kernel, iterations=live_dilation_iters)
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filled = np.zeros_like(thresh)
-    cv2.drawContours(filled, contours, -1, 255, -1)
-    
-    filled[user_cuts > 0] = 0
-    num_labels, labels = cv2.connectedComponents(filled, connectivity=4)
-    selected_labels = {l for l in selected_labels if l < num_labels}
-    needs_redraw = True
-
 def mouse_click(event, x, y, flags, param):
     global drawing_cut, last_cut_pt, is_panning, last_pan_pt
     global zoom_level, view_x, view_y, needs_redraw
 
     ix, iy = screen_to_img(x, y)
 
-    # 1. ZOOM: Scroll Wheel
     if event == cv2.EVENT_MOUSEWHEEL:
         delta = flags >> 16
         zoom_factor = 1.15 if delta > 0 else (1 / 1.15)
-        
-        ix_before = (x / zoom_level) + view_x
-        iy_before = (y / zoom_level) + view_y
-        
+        ix_before, iy_before = (x / zoom_level) + view_x, (y / zoom_level) + view_y
         zoom_level = max(0.05, min(zoom_level * zoom_factor, 50.0))
-        
-        view_x = ix_before - (x / zoom_level)
-        view_y = iy_before - (y / zoom_level)
+        view_x, view_y = ix_before - (x / zoom_level), iy_before - (y / zoom_level)
         return
-
-    # 2. PANNING: Middle Click & Drag
-    if event == cv2.EVENT_MBUTTONDOWN:
+    elif event == cv2.EVENT_MBUTTONDOWN:
         is_panning = True
         last_pan_pt = (x, y)
     elif event == cv2.EVENT_MBUTTONUP:
         is_panning = False
     elif event == cv2.EVENT_MOUSEMOVE and is_panning:
-        dx = x - last_pan_pt[0]
-        dy = y - last_pan_pt[1]
-        view_x -= dx / zoom_level
-        view_y -= dy / zoom_level
+        view_x -= (x - last_pan_pt[0]) / zoom_level
+        view_y -= (y - last_pan_pt[1]) / zoom_level
         last_pan_pt = (x, y)
         return
 
-    # 3. SELECTION: Left Click
     if event == cv2.EVENT_LBUTTONDOWN:
         clicked_label = labels[iy, ix]
         if clicked_label > 0: 
@@ -118,9 +168,10 @@ def mouse_click(event, x, y, flags, param):
                 selected_labels.remove(clicked_label)
             else:
                 selected_labels.add(clicked_label)
+            update_approved_mask()
+            invalidate_future_caches()
             needs_redraw = True
 
-    # 4. SCALPEL: Right Click & Drag
     elif event == cv2.EVENT_RBUTTONDOWN:
         drawing_cut = True
         last_cut_pt = (ix, iy)
@@ -134,148 +185,232 @@ def mouse_click(event, x, y, flags, param):
     elif event == cv2.EVENT_RBUTTONUP:
         drawing_cut = False
         last_cut_pt = None
+        if np.any(user_cuts > 0):
+            slice_cuts[current_idx] = user_cuts.copy()
         recompute_components()
+        invalidate_future_caches()
 
-def load_current_image():
-    global img, image_name, user_cuts, selected_labels
-    image_name = image_files[current_idx]
-    image_path = os.path.join(input_dir, image_name)
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    
-    user_cuts = np.zeros_like(img)
-    selected_labels.clear()
-    reset_view()
-    recompute_components()
-    print(f"\nLoaded: {image_name}")
-
-# Initialize UI
+# --- Initialize Windows ---
 load_current_image()
-window_name = "CC & Watershed Micro-CT Editor"
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+# Render Separate Controls Window
+controls_data = [
+    ("=== MICRO-CT SEGMENTATION CONTROLS ===", ""),
+    ("", ""),
+    ("Left Click", "Select / Unselect a bone plate"),
+    ("Right Click & Drag", "Draw 'scalpel' line to sever a bridging suture"),
+    ("Scroll Wheel", "Zoom in/out"),
+    ("Middle Click & Drag", "Pan image"),
+    ("", ""),
+    ("'[' / ']' Keys", "Decrease/Increase LIVE Dilation by 1 px"),
+    ("'{' / '}' Keys", "Decrease/Increase EXPORT Dilation by 1 px"),
+    ("'v' / 'b' Keys", "Set START / END Slice boundary"),
+    ("'x'", "Reset boundaries to full volume"),
+    ("", ""),
+    ("'e'", "BATCH EXPORT entire volume"),
+    ("'s'", "SAVE CURRENT SINGLE SLICE only"),
+    ("'j' / 'h' Keys", "Next / Previous image (Auto-propagates)"),
+    ("", ""),
+    ("'u'", "Undo/Clear SCALPEL CUTS only on this slice"),
+    ("'c'", "Clear BOTH selections and cuts on this slice"),
+    ("'r'", "Reset camera zoom and pan"),
+    ("'m'", "Toggle Pure Mask View"),
+    ("'o'", "Open a new dataset folder"),
+    ("'l'", "Lock/Unlock parameter tuning"),
+    ("'q'", "Quit")
+]
+
+# Increased width to 650 to accommodate the table layout
+controls_img = np.zeros((680, 650, 3), dtype=np.uint8)
+y_offset = 30
+
+for key_text, action_text in controls_data:
+    if action_text == "":
+        # Draw headers or empty lines
+        cv2.putText(controls_img, key_text, (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    else:
+        # Draw Column 1 (Keys) at x=15
+        cv2.putText(controls_img, key_text, (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        # Draw Column 2 (Actions) at x=210
+        cv2.putText(controls_img, action_text, (210, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+    
+    y_offset += 25
+
+cv2.imshow("Controls Menu", controls_img)
+
+# Main Viewer Window
+window_name = "Volumetric CC Editor"
+# The KEEPRATIO flag prevents the image from skewing when the window is stretched
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
 cv2.resizeWindow(window_name, VIEW_W, VIEW_H)
 cv2.setMouseCallback(window_name, mouse_click)
 
-print("\n=== CONTROLS ===")
-print("Left Click          : Select / Unselect a bone plate")
-print("Right Click & Drag  : Draw 'scalpel' line to cut a bridging suture")
-print("Scroll Wheel        : Zoom in/out at cursor location")
-print("Middle Click & Drag : Pan around the zoomed image")
-print("',' / '.' Keys      : Decrease/Increase Otsu Threshold by 1%")
-print("'[' / ']' Keys      : Decrease/Increase LIVE Dilation by 1 pixel")
-print("'{' / '}' Keys      : Decrease/Increase EXPORT Dilation by 1 pixel (Shift + [ / ])")
-print("'l'                 : Lock/Unlock parameter tuning")
-print("'r'                 : Reset view to fit screen")
-print("'m'                 : Toggle Binary Mask View")
-print("'c'                 : Clear all selections and cuts")
-print("'s'                 : Save CTAn .bmp mask")
-print("'n' / 'p'           : Next / Previous image")
-print("'q'                 : Quit")
-
 while True:
-    if needs_redraw:
-        active_mask = np.isin(labels, list(selected_labels))
-        combined_mask = (active_mask * 255).astype(np.uint8)
+    # 1. Exit cleanly if the user clicks the 'X' to close either window
+    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+        break
+    if cv2.getWindowProperty("Controls Menu", cv2.WND_PROP_VISIBLE) < 1:
+        break
 
+    # 2. Dynamically update the canvas size to match the live window dimensions (prevents skewing)
+    rect = cv2.getWindowImageRect(window_name)
+
+    if rect[2] > 0 and rect[3] > 0:
+        VIEW_W, VIEW_H = rect[2], rect[3]
+    if needs_redraw:
         if pure_mask_view:
             display_img = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
         else:
             display_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            
-            # Apply 20% translucent red overlay to selected objects
             if selected_labels:
                 red_overlay = display_img.copy()
                 red_overlay[combined_mask > 0] = [0, 0, 255]
                 blended_red = cv2.addWeighted(display_img, 0.8, red_overlay, 0.2, 0)
                 display_img[combined_mask > 0] = blended_red[combined_mask > 0]
 
-            # Apply 20% opaque white overlay to scalpel cuts
             if np.any(user_cuts > 0):
                 white_scalpel = np.full_like(display_img, 255)
                 blended_scalpel = cv2.addWeighted(display_img, 0.8, white_scalpel, 0.2, 0)
                 display_img[user_cuts > 0] = blended_scalpel[user_cuts > 0]
-            
         needs_redraw = False
 
-    M = np.array([
-        [zoom_level, 0, -view_x * zoom_level],
-        [0, zoom_level, -view_y * zoom_level]
-    ], dtype=np.float32)
-    
+    M = np.array([[zoom_level, 0, -view_x * zoom_level], [0, zoom_level, -view_y * zoom_level]], dtype=np.float32)
     view = cv2.warpAffine(display_img, M, (VIEW_W, VIEW_H), flags=cv2.INTER_NEAREST)
 
-    status_text_1 = f"{image_name} | Zoom: {zoom_level:.1f}x | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
-    status_text_2 = f"Otsu: {otsu_multiplier*100:.0f}% | Live Dilate: {live_dilation_iters}px | Export Dilate: {export_dilation_iters}px | Locked: {params_locked}"
+    # Turn text RED (0, 0, 255) if a scalpel cut exists on the current slice
+    text_color_1 = (0, 0, 255) if np.any(user_cuts > 0) else (255, 255, 255)
     
-    cv2.putText(view, status_text_1, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    cv2.putText(view, status_text_2, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if params_locked else (255, 255, 255), 1)
+    status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
+    status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked}"
+    
+    cv2.putText(view, status_1, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color_1, 1)
+    cv2.putText(view, status_2, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if params_locked else (255, 255, 255), 1)
+
     cv2.imshow(window_name, view)
     key = cv2.waitKey(15) & 0xFF
 
-    if key == ord("s"):
-        final_mask = combined_mask.copy()
+    if key == ord("e"):
+        print(f"\n--- Starting Batch Export (Slices {z_min+1} to {z_max+1}) ---")
+        os.makedirs(output_dir, exist_ok=True)
+        last_valid_mask = None
         
-        # Apply EXPORT dilation ONLY when saving the final bitmap
-        if export_dilation_iters > 0:
-            kernel = np.ones((3, 3), np.uint8)
-            final_mask = cv2.dilate(final_mask, kernel, iterations=export_dilation_iters)
+        for i in range(len(image_files)):
+            out_path = os.path.join(output_dir, os.path.splitext(image_files[i])[0] + ".bmp")
             
-        base_name = os.path.splitext(image_name)[0]
-        output_path = os.path.join(output_dir, f"{base_name}.bmp")
-        cv2.imwrite(output_path, final_mask)
-        print(f"Saved binary CTAn mask (Live Dilate: {live_dilation_iters}px, Export Dilate: {export_dilation_iters}px) to: {output_path}")
+            if i < z_min or i > z_max:
+                empty_mask = np.zeros(IMAGE_SHAPE, dtype=np.uint8)
+                Image.fromarray(empty_mask).convert('1').save(out_path)
+                continue
+                
+            if i in slice_approved_masks:
+                raw_mask = slice_approved_masks[i]
+            else:
+                temp_img = cv2.imread(os.path.join(input_dir, image_files[i]), cv2.IMREAD_GRAYSCALE)
+                c_array = slice_cuts.get(i, np.zeros(IMAGE_SHAPE, dtype=np.uint8))
+                _, temp_labels = generate_raw_components(temp_img, c_array)
+                temp_sel = get_overlapping_labels(temp_labels, last_valid_mask)
+                raw_mask = (np.isin(temp_labels, list(temp_sel)) * 255).astype(np.uint8)
+                slice_approved_masks[i] = raw_mask
+            
+            last_valid_mask = raw_mask.copy()
+            
+            if export_dilation_iters > 0:
+                kernel = np.ones((3, 3), np.uint8)
+                last_valid_mask = cv2.dilate(last_valid_mask, kernel, iterations=export_dilation_iters)
+                
+            Image.fromarray(last_valid_mask).convert('1').save(out_path)
+            if i % 50 == 0:
+                print(f"Exported {i+1}/{len(image_files)}...")
+                
+        print("--- Batch Export Complete! ---\n")
         
+    elif key == ord("o"):
+        new_dir = filedialog.askdirectory(initialdir=os.path.dirname(input_dir), title="Select New Dataset Folder")
+        
+        if new_dir:
+            input_dir = new_dir
+            dataset_name = os.path.basename(os.path.normpath(input_dir))
+            output_dir = os.path.join(r"F:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks", dataset_name)
+            
+            image_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(valid_exts)])
+            if not image_files:
+                print(f"Error: No valid images found in {input_dir}")
+            else:
+                sample_img = cv2.imread(os.path.join(input_dir, image_files[0]), cv2.IMREAD_GRAYSCALE)
+                IMAGE_SHAPE = sample_img.shape
+                current_idx = 0
+                z_min = 0
+                z_max = len(image_files) - 1
+                slice_cuts.clear()
+                slice_approved_masks.clear()
+                
+                load_current_image()
+                print(f"\n--- Switched to Dataset: {dataset_name} ---")
+
+    elif key == ord("v"):
+        z_min = current_idx
+        print(f"Start bound set to slice {z_min+1}")
+    elif key == ord("b"):
+        z_max = current_idx
+        print(f"End bound set to slice {z_max+1}")
+    elif key == ord("x"):
+        z_min = 0
+        z_max = len(image_files) - 1
+        print(f"Bounds reset to full volume: 1 to {len(image_files)}")
+    elif key == ord("j"):
+        prev = current_idx
+        current_idx = (current_idx + 1) % len(image_files)
+        load_current_image(propagate_from=prev)
+    elif key == ord("h"):
+        prev = current_idx
+        current_idx = (current_idx - 1) % len(image_files)
+        load_current_image(propagate_from=prev)
     elif key == ord("m"):
         pure_mask_view = not pure_mask_view
         needs_redraw = True
     elif key == ord("c"):
         selected_labels.clear()
         user_cuts.fill(0)
+        if current_idx in slice_cuts: 
+            del slice_cuts[current_idx]
         recompute_components()
+        invalidate_future_caches()
+    elif key == ord("u"):
+        user_cuts.fill(0)
+        if current_idx in slice_cuts:
+            del slice_cuts[current_idx]
+        recompute_components()
+        invalidate_future_caches()
     elif key == ord("r"):
         reset_view()
     elif key == ord("l"):
         params_locked = not params_locked
         needs_redraw = True
-    elif key == ord(".") or key == ord(">"):
-        if not params_locked:
-            otsu_multiplier = min(1.50, otsu_multiplier + 0.01)
-            recompute_components()
-    elif key == ord(",") or key == ord("<"):
-        if not params_locked:
-            otsu_multiplier = max(0.01, otsu_multiplier - 0.01)
-            recompute_components()
     elif key == ord("]"):
-        if not params_locked:
-            live_dilation_iters += 1
-            recompute_components()
+        if not params_locked: live_dilation_iters += 1; recompute_components()
     elif key == ord("["):
-        if not params_locked:
-            live_dilation_iters = max(0, live_dilation_iters - 1)
-            recompute_components()
+        if not params_locked: live_dilation_iters = max(0, live_dilation_iters - 1); recompute_components()
     elif key == ord("}"):
-        if not params_locked:
-            export_dilation_iters += 1
-            needs_redraw = True
+        if not params_locked: export_dilation_iters += 1; needs_redraw = True
     elif key == ord("{"):
-        if not params_locked:
-            export_dilation_iters = max(0, export_dilation_iters - 1)
-            needs_redraw = True
-    elif key == ord("n"):
-        current_idx = (current_idx + 1) % len(image_files)
-        load_current_image()
-    elif key == ord("p"):
-        current_idx = (current_idx - 1) % len(image_files)
-        load_current_image()
-    elif key in (ord('+'), ord('='), ord('-')):
-        cx, cy = VIEW_W / 2, VIEW_H / 2
-        ix_before = (cx / zoom_level) + view_x
-        iy_before = (cy / zoom_level) + view_y
-        
-        zoom_level = min(zoom_level * 1.15, 50.0) if key != ord('-') else max(zoom_level / 1.15, 0.05)
-        
-        view_x = ix_before - (cx / zoom_level)
-        view_y = iy_before - (cy / zoom_level)
-    elif key in (ord("q"), 27):
-        break
+        if not params_locked: export_dilation_iters = max(0, export_dilation_iters - 1); needs_redraw = True
+    elif key in (ord('s'), ord('+'), ord('='), ord('-'), ord('q'), 27):
+        if key == ord('s'):
+            final_mask = combined_mask.copy()
+            if export_dilation_iters > 0:
+                kernel = np.ones((3, 3), np.uint8)
+                final_mask = cv2.dilate(final_mask, kernel, iterations=export_dilation_iters)
+            
+            os.makedirs(output_dir, exist_ok=True)
+            out_path = os.path.join(output_dir, f"{os.path.splitext(image_name)[0]}.bmp")
+            Image.fromarray(final_mask).convert('1').save(out_path)
+            print(f"Saved active slice to: {out_path}")
+        elif key in (ord("q"), 27):
+            break
+        else:
+            cx, cy = VIEW_W / 2, VIEW_H / 2
+            ix_before, iy_before = (cx / zoom_level) + view_x, (cy / zoom_level) + view_y
+            zoom_level = min(zoom_level * 1.15, 50.0) if key != ord('-') else max(zoom_level / 1.15, 0.05)
+            view_x, view_y = ix_before - (cx / zoom_level), iy_before - (cy / zoom_level)
 
 cv2.destroyAllWindows()
