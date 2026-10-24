@@ -1,8 +1,12 @@
+# NOTE: this script is optimised for use with PC with Dual Xeon CPUs, 
+# 384GB of system RAM, and an NVIDIA RTX A2000 GPU (12GB VRAM).
+# 
 # This script performs automated rigid 3D registration of microCT datasets.
 # It replaces manual alignment in Bruker DataViewer by using SimpleITK to calculate 
 # a mathematical transform based on Mattes Mutual Information. It automatically 
 # traverses a batch directory structure, processing unaligned 'recon' folders and 
 # outputting 'realigned' folders complete with updated, compliant Bruker metadata logs.
+# OPTIMISED FOR PC2: Dual Xeon CPUs, 384GB RAM, RTX A2000.
 
 import os
 import glob
@@ -117,12 +121,18 @@ HU calibration modified=0
 # bone mass first, allowing the algorithm to seamlessly resolve large rotational 
 # differences (like a skull mounted diagonally upside down).
 # =============================================================================
-def calculate_rigid_alignment(atlas_img, target_img):
+def calculate_rigid_alignment(atlas_img, target_img, num_threads=None):
     """
     Computes the 3D rotation and translation matrix.
     Updated for robust alignment to handle large initial angles (e.g., ~50 degrees).
     """
     print("Calculating robust rigid 3D alignment (this may take a few minutes)...")
+    
+    # PC2 OPTIMIZATION: Explicitly set SimpleITK to utilize all available Xeon cores
+    if num_threads:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(num_threads)
+        print(f"Utilizing {num_threads} CPU threads for mathematical optimization.")
+        
     atlas_f = sitk.Cast(atlas_img, sitk.sitkFloat32)
     target_f = sitk.Cast(target_img, sitk.sitkFloat32)
     
@@ -248,6 +258,14 @@ if __name__ == "__main__":
         help="1=Dynamic Z (preserves length), 2=Atlas BBox (strict crop)."
     )
     
+    # PC2 OPTIMIZATION ARGUMENT
+    parser.add_argument(
+        "--threads", 
+        type=int, 
+        default=0, 
+        help="Override default CPU threads used by SimpleITK. Leave at 0 to use all available."
+    )
+    
     args = parser.parse_args()
 
     # 1. Establish the default Atlas paths based on the chosen target
@@ -281,6 +299,14 @@ if __name__ == "__main__":
     
     skull_folders = [f.path for f in os.scandir(MAIN_DATA_DIR) if f.is_dir()]
     
+    # PC2 OPTIMIZATION: Setup threads
+    num_threads = None
+    if args.threads > 0:
+        num_threads = args.threads
+    else:
+        # Defaults to all physical cores available to the OS
+        num_threads = os.cpu_count()
+    
     for skull_dir in skull_folders:
         skull_name = os.path.basename(skull_dir)
         recon_dir = os.path.join(skull_dir, "recon")
@@ -306,7 +332,7 @@ if __name__ == "__main__":
         
         try:
             target = load_bmp_stack(recon_dir)
-            transform = calculate_rigid_alignment(atlas, target)
+            transform = calculate_rigid_alignment(atlas, target, num_threads=num_threads)
             realigned_img = resample_dataset(target, atlas, transform, mode=OUTPUT_MODE)
             
             # Save to the new 'realigned' folder using the specific skull name as a prefix
@@ -344,6 +370,12 @@ if __name__ == "__main__":
 #
 # 3 - Realigning Right Femurs and forcing strict cropping (Mode 2):
 # python batch_dataset_realignment.py --target femur_right --input "D:/External_Drive/Femur_Project" --mode 2
+#
+# --- PC2 OPTIMIZATION ---
+# By default, SimpleITK will try to use all available CPU cores. If you want to limit 
+# the number of threads (e.g., leaving cores free for other background tasks on PC2), 
+# you can use the --threads flag:
+# python batch_dataset_realignment.py --target skull --input "E:/Mouse_Skulls" --threads 16
 #
 # --- WHAT THE MODES DO ---
 # --mode 1 (Dynamic Z - Default & Recommended): 
