@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 
 # 1. Define input and output directories
-input_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing\input_data"
+input_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing"
 output_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks"
 os.makedirs(output_dir, exist_ok=True)
 
@@ -27,6 +27,12 @@ pure_mask_view = False
 drawing_cut = False
 last_cut_pt = None
 
+# Interactive parameters
+otsu_multiplier = 0.95
+live_dilation_iters = 0     # Affects the live thresholding and component bridging
+export_dilation_iters = 1   # Applied ONLY to the final saved mask
+params_locked = False
+
 # Rendering optimization
 needs_redraw = True
 display_img = None
@@ -40,29 +46,33 @@ is_panning = False
 last_pan_pt = None
 
 def reset_view():
-    """Calculates the exact zoom and pan required to fit the image in the window."""
     global zoom_level, view_x, view_y
     zoom_level = min(VIEW_W / img.shape[1], VIEW_H / img.shape[0])
     view_x = (img.shape[1] - (VIEW_W / zoom_level)) / 2
     view_y = (img.shape[0] - (VIEW_H / zoom_level)) / 2
 
 def screen_to_img(x, y):
-    """Maps mouse coordinates from the scaled window back to original image pixels."""
     ix = int((x / zoom_level) + view_x)
     iy = int((y / zoom_level) + view_y)
     return max(0, min(ix, img.shape[1] - 1)), max(0, min(iy, img.shape[0] - 1))
 
 def recompute_components():
-    """Applies Otsu threshold, fills holes, applies user cuts, and labels discrete objects."""
     global labels, num_labels, selected_labels, needs_redraw
-    _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    otsu_val, _ = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, thresh = cv2.threshold(img, otsu_val * otsu_multiplier, 255, cv2.THRESH_BINARY)
+    
+    # Apply LIVE dilation (affects what is clickable/merged on screen)
+    if live_dilation_iters > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.dilate(thresh, kernel, iterations=live_dilation_iters)
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(thresh)
     cv2.drawContours(filled, contours, -1, 255, -1)
     
     filled[user_cuts > 0] = 0
-    num_labels, labels = cv2.connectedComponents(filled, connectivity=8)
+    num_labels, labels = cv2.connectedComponents(filled, connectivity=4)
     selected_labels = {l for l in selected_labels if l < num_labels}
     needs_redraw = True
 
@@ -114,12 +124,10 @@ def mouse_click(event, x, y, flags, param):
     elif event == cv2.EVENT_RBUTTONDOWN:
         drawing_cut = True
         last_cut_pt = (ix, iy)
-        # Set exact starting pixel to slice rather than drawing a multi-pixel circle
         user_cuts[iy, ix] = 255  
         needs_redraw = True
     elif event == cv2.EVENT_MOUSEMOVE and drawing_cut:
         if last_cut_pt is not None:
-            # Set exact 1-pixel thickness for sub-pixel accuracy
             cv2.line(user_cuts, last_cut_pt, (ix, iy), 255, thickness=1)
             last_cut_pt = (ix, iy)
             needs_redraw = True
@@ -152,7 +160,10 @@ print("Left Click          : Select / Unselect a bone plate")
 print("Right Click & Drag  : Draw 'scalpel' line to cut a bridging suture")
 print("Scroll Wheel        : Zoom in/out at cursor location")
 print("Middle Click & Drag : Pan around the zoomed image")
-print("'+' / '-' Keys      : Keyboard zoom alternative")
+print("',' / '.' Keys      : Decrease/Increase Otsu Threshold by 1%")
+print("'[' / ']' Keys      : Decrease/Increase LIVE Dilation by 1 pixel")
+print("'{' / '}' Keys      : Decrease/Increase EXPORT Dilation by 1 pixel (Shift + [ / ])")
+print("'l'                 : Lock/Unlock parameter tuning")
 print("'r'                 : Reset view to fit screen")
 print("'m'                 : Toggle Binary Mask View")
 print("'c'                 : Clear all selections and cuts")
@@ -170,16 +181,18 @@ while True:
         else:
             display_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             
+            # Apply 20% translucent red overlay to selected objects
             if selected_labels:
-                white_layer = np.full_like(display_img, 255)
-                mask_bool = combined_mask > 0
-                display_img[mask_bool] = cv2.addWeighted(
-                    display_img[mask_bool], 0.35, white_layer[mask_bool], 0.65, 0
-                )
-                contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(display_img, contours, -1, (255, 255, 255), 1)
+                red_overlay = display_img.copy()
+                red_overlay[combined_mask > 0] = [0, 0, 255]
+                blended_red = cv2.addWeighted(display_img, 0.8, red_overlay, 0.2, 0)
+                display_img[combined_mask > 0] = blended_red[combined_mask > 0]
 
-            display_img[user_cuts > 0] = [0, 0, 255]
+            # Apply 20% opaque white overlay to scalpel cuts
+            if np.any(user_cuts > 0):
+                white_scalpel = np.full_like(display_img, 255)
+                blended_scalpel = cv2.addWeighted(display_img, 0.8, white_scalpel, 0.2, 0)
+                display_img[user_cuts > 0] = blended_scalpel[user_cuts > 0]
             
         needs_redraw = False
 
@@ -190,18 +203,27 @@ while True:
     
     view = cv2.warpAffine(display_img, M, (VIEW_W, VIEW_H), flags=cv2.INTER_NEAREST)
 
-    status_text = f"{image_name} | Zoom: {zoom_level:.1f}x | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
-    cv2.putText(view, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
-    cv2.putText(view, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
+    status_text_1 = f"{image_name} | Zoom: {zoom_level:.1f}x | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
+    status_text_2 = f"Otsu: {otsu_multiplier*100:.0f}% | Live Dilate: {live_dilation_iters}px | Export Dilate: {export_dilation_iters}px | Locked: {params_locked}"
+    
+    cv2.putText(view, status_text_1, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(view, status_text_2, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if params_locked else (255, 255, 255), 1)
     cv2.imshow(window_name, view)
     key = cv2.waitKey(15) & 0xFF
 
     if key == ord("s"):
+        final_mask = combined_mask.copy()
+        
+        # Apply EXPORT dilation ONLY when saving the final bitmap
+        if export_dilation_iters > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            final_mask = cv2.dilate(final_mask, kernel, iterations=export_dilation_iters)
+            
         base_name = os.path.splitext(image_name)[0]
         output_path = os.path.join(output_dir, f"{base_name}.bmp")
-        cv2.imwrite(output_path, combined_mask)
-        print(f"Saved binary CTAn mask to: {output_path}")
+        cv2.imwrite(output_path, final_mask)
+        print(f"Saved binary CTAn mask (Live Dilate: {live_dilation_iters}px, Export Dilate: {export_dilation_iters}px) to: {output_path}")
+        
     elif key == ord("m"):
         pure_mask_view = not pure_mask_view
         needs_redraw = True
@@ -211,6 +233,33 @@ while True:
         recompute_components()
     elif key == ord("r"):
         reset_view()
+    elif key == ord("l"):
+        params_locked = not params_locked
+        needs_redraw = True
+    elif key == ord(".") or key == ord(">"):
+        if not params_locked:
+            otsu_multiplier = min(1.50, otsu_multiplier + 0.01)
+            recompute_components()
+    elif key == ord(",") or key == ord("<"):
+        if not params_locked:
+            otsu_multiplier = max(0.01, otsu_multiplier - 0.01)
+            recompute_components()
+    elif key == ord("]"):
+        if not params_locked:
+            live_dilation_iters += 1
+            recompute_components()
+    elif key == ord("["):
+        if not params_locked:
+            live_dilation_iters = max(0, live_dilation_iters - 1)
+            recompute_components()
+    elif key == ord("}"):
+        if not params_locked:
+            export_dilation_iters += 1
+            needs_redraw = True
+    elif key == ord("{"):
+        if not params_locked:
+            export_dilation_iters = max(0, export_dilation_iters - 1)
+            needs_redraw = True
     elif key == ord("n"):
         current_idx = (current_idx + 1) % len(image_files)
         load_current_image()
@@ -226,7 +275,6 @@ while True:
         
         view_x = ix_before - (cx / zoom_level)
         view_y = iy_before - (cy / zoom_level)
-
     elif key in (ord("q"), 27):
         break
 
