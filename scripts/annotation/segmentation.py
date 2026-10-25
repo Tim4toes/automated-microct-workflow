@@ -34,6 +34,8 @@ z_max = len(image_files) - 1
 slice_cuts = {}            
 slice_adds = {}
 slice_approved_masks = {}  
+keyframes = set()            # Tracks slices where user explicitly clicked/edited/interpolated
+interpolated_slices = set()  # Protects rigid SDF tunnel masks from being overwritten by Otsu
 
 # State variables for active slice segmentation
 labels = None
@@ -71,26 +73,62 @@ def save_workspace():
     os.makedirs(output_dir, exist_ok=True)
     session_file = os.path.join(output_dir, f"{dataset_name}_workspace.npz")
     save_dict = {}
-    for k, v in slice_cuts.items(): save_dict[f"cut_{k}"] = v
-    for k, v in slice_adds.items(): save_dict[f"add_{k}"] = v
-    for k, v in slice_approved_masks.items(): save_dict[f"mask_{k}"] = v
+    
+    # Cast arrays to booleans (True/False) to cut RAM and file size by 87.5%
+    for k, v in slice_cuts.items(): save_dict[f"cut_{k}"] = v.astype(np.bool_)
+    for k, v in slice_adds.items(): save_dict[f"add_{k}"] = v.astype(np.bool_)
+    for k, v in slice_approved_masks.items(): save_dict[f"mask_{k}"] = v.astype(np.bool_)
+    
+    # Save metadata for keyframes, interpolated regions, and bounds
+    save_dict["meta_keyframes"] = np.array(list(keyframes), dtype=np.int32)
+    save_dict["meta_interpolated"] = np.array(list(interpolated_slices), dtype=np.int32)
+    save_dict["meta_bounds"] = np.array([z_min, z_max], dtype=np.int32)
+    
     np.savez_compressed(session_file, **save_dict)
     print(f"\n--- Workspace successfully saved to {session_file} ---")
 
 def load_workspace():
-    global slice_cuts, slice_adds, slice_approved_masks
+    global slice_cuts, slice_adds, slice_approved_masks, keyframes, interpolated_slices, z_min, z_max
     slice_cuts.clear()
     slice_adds.clear()
     slice_approved_masks.clear()
+    keyframes.clear()
+    interpolated_slices.clear()
+    
     session_file = os.path.join(output_dir, f"{dataset_name}_workspace.npz")
+    
     if os.path.exists(session_file):
         data = np.load(session_file)
         for key in data.files:
+            if key == "meta_keyframes":
+                keyframes.update(data[key].tolist())
+                continue
+            elif key == "meta_interpolated":
+                interpolated_slices.update(data[key].tolist())
+                continue
+            elif key == "meta_bounds":
+                bounds = data[key].tolist()
+                z_min, z_max = bounds[0], min(bounds[1], len(image_files) - 1)
+                continue
+                
             idx = int(key.split('_')[1])
-            if key.startswith("cut_"): slice_cuts[idx] = data[key]
-            elif key.startswith("add_"): slice_adds[idx] = data[key]
-            elif key.startswith("mask_"): slice_approved_masks[idx] = data[key]
+            # Cast back to 8-bit and multiply by 255 to restore the 0/255 pixel values
+            restored_array = data[key].astype(np.uint8) * 255
+            
+            if key.startswith("cut_"): slice_cuts[idx] = restored_array
+            elif key.startswith("add_"): slice_adds[idx] = restored_array
+            elif key.startswith("mask_"): slice_approved_masks[idx] = restored_array
+            
+        # Backward compatibility: if loading an older workspace without keyframe metadata
+        if not keyframes:
+            keyframes.update(slice_cuts.keys())
+            keyframes.update(slice_adds.keys())
+            if 0 in slice_approved_masks:
+                keyframes.add(0)
+                
         print(f"\n--- Loaded existing workspace for '{dataset_name}' ---")
+    else:
+        print(f"\n--- No saved workspace found at {session_file} ---")
 
 # --- Core Segmentation Logic ---
 
@@ -125,18 +163,32 @@ def update_approved_mask():
     global combined_mask
     active_mask = np.isin(labels, list(selected_labels))
     combined_mask = (active_mask * 255).astype(np.uint8)
-    slice_approved_masks[current_idx] = combined_mask.copy()
+    if selected_labels:
+        slice_approved_masks[current_idx] = combined_mask.copy()
+    else:
+        slice_approved_masks.pop(current_idx, None)
 
 def invalidate_future_caches():
-    future_keys = [k for k in slice_approved_masks if k > current_idx]
-    if future_keys:
-        for k in future_keys:
-            del slice_approved_masks[k]
+    # Only invalidate auto-propagated caches up to the next user keyframe
+    future_keyframes = [k for k in keyframes if k > current_idx]
+    stop_idx = min(future_keyframes) if future_keyframes else len(image_files)
+    
+    future_keys = [k for k in slice_approved_masks if current_idx < k < stop_idx]
+    for k in future_keys:
+        del slice_approved_masks[k]
+        interpolated_slices.discard(k)
 
 def recompute_components(auto_select_from_mask=None):
-    global labels, num_labels, selected_labels, needs_redraw
+    global labels, num_labels, selected_labels, combined_mask, needs_redraw
     num_labels, labels = generate_raw_components(img, user_cuts, user_adds)
     
+    # If this slice holds a rigid interpolated mask, preserve it until edited
+    if current_idx in interpolated_slices and current_idx in slice_approved_masks:
+        combined_mask = slice_approved_masks[current_idx].copy()
+        selected_labels = get_overlapping_labels(labels, combined_mask)
+        needs_redraw = True
+        return
+
     if auto_select_from_mask is not None:
         selected_labels = get_overlapping_labels(labels, auto_select_from_mask)
     else:
@@ -145,18 +197,56 @@ def recompute_components(auto_select_from_mask=None):
     update_approved_mask()
     needs_redraw = True
 
+def get_signed_distance_field(mask):
+    # Calculate distance to the closest background pixel (positive inside bone)
+    inside = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+    # Calculate distance to the closest bone pixel (negative outside bone)
+    inv_mask = cv2.bitwise_not(mask)
+    outside = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 3)
+    return inside - outside
+
+def interpolate_gap(start_idx, end_idx):
+    mask_A = slice_approved_masks[start_idx]
+    mask_B = slice_approved_masks[end_idx]
+    
+    sdf_A = get_signed_distance_field(mask_A)
+    sdf_B = get_signed_distance_field(mask_B)
+    
+    steps = end_idx - start_idx
+    for i in range(1, steps):
+        weight = i / steps
+        # Blend the 3D distance topologies
+        interp_sdf = sdf_A * (1.0 - weight) + sdf_B * weight
+        interp_mask = (interp_sdf > 0).astype(np.uint8) * 255
+        
+        target_idx = start_idx + i
+        slice_approved_masks[target_idx] = interp_mask
+        interpolated_slices.add(target_idx)
+        keyframes.discard(target_idx)
+        
+        # Clear legacy manual edits in the gap so they do not conflict
+        if target_idx in slice_cuts: del slice_cuts[target_idx]
+        if target_idx in slice_adds: del slice_adds[target_idx]
+
 def load_current_image(propagate_from=None):
     global img, image_name, user_cuts, user_adds, selected_labels
     image_name = image_files[current_idx]
     img = cv2.imread(os.path.join(input_dir, image_name), cv2.IMREAD_GRAYSCALE)
     
-    # Clone cuts and bridges from the previous slice if Persistent Mode is ON
-    if persistent_edits and propagate_from is not None:
-        if propagate_from in slice_cuts and current_idx not in slice_cuts:
-            slice_cuts[current_idx] = slice_cuts[propagate_from].copy()
-        if propagate_from in slice_adds and current_idx not in slice_adds:
-            slice_adds[current_idx] = slice_adds[propagate_from].copy()
-            
+    # MERGE cuts and bridges from the previous slice if Persistent Mode is ON
+    if persistent_edits and propagate_from is not None and current_idx not in interpolated_slices:
+        if propagate_from in slice_cuts:
+            if current_idx in slice_cuts:
+                slice_cuts[current_idx] = cv2.bitwise_or(slice_cuts[current_idx], slice_cuts[propagate_from])
+            else:
+                slice_cuts[current_idx] = slice_cuts[propagate_from].copy()
+                
+        if propagate_from in slice_adds:
+            if current_idx in slice_adds:
+                slice_adds[current_idx] = cv2.bitwise_or(slice_adds[current_idx], slice_adds[propagate_from])
+            else:
+                slice_adds[current_idx] = slice_adds[propagate_from].copy()
+                
     user_cuts = slice_cuts.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     user_adds = slice_adds.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     
@@ -211,15 +301,24 @@ def mouse_click(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         clicked_label = labels[iy, ix]
         if clicked_label > 0: 
+            # Clicking on an interpolated slice snaps it back to dynamic Otsu mode
+            interpolated_slices.discard(current_idx)
             if clicked_label in selected_labels:
                 selected_labels.remove(clicked_label)
             else:
                 selected_labels.add(clicked_label)
+            
+            if selected_labels:
+                keyframes.add(current_idx)
+            else:
+                keyframes.discard(current_idx)
+                
             update_approved_mask()
             invalidate_future_caches()
             needs_redraw = True
 
     elif event == cv2.EVENT_RBUTTONDOWN:
+        interpolated_slices.discard(current_idx)
         if flags & cv2.EVENT_FLAG_SHIFTKEY:
             drawing_add = True
             last_add_pt = (ix, iy)
@@ -246,11 +345,13 @@ def mouse_click(event, x, y, flags, param):
             last_cut_pt = None
             if np.any(user_cuts > 0):
                 slice_cuts[current_idx] = user_cuts.copy()
+                keyframes.add(current_idx)
         if drawing_add:
             drawing_add = False
             last_add_pt = None
             if np.any(user_adds > 0):
                 slice_adds[current_idx] = user_adds.copy()
+                keyframes.add(current_idx)
                 
         recompute_components()
         invalidate_future_caches()
@@ -281,6 +382,7 @@ controls_data = [
     ("", ""),
     ("'u'", "Undo SCALPEL & BRIDGES only on this slice"),
     ("'p'", "Toggle PERSISTENT edits (auto-copy to next slice)"),
+    ("'i'", "INTERPOLATE regions from previous keyframe"),
     ("'c'", "Clear BOTH selections and cuts on this slice"),
     ("'r'", "Reset camera zoom and pan"),
     ("'m'", "Toggle Pure Mask View"),
@@ -289,7 +391,7 @@ controls_data = [
     ("'q'", "Quit")
 ]
 
-controls_img = np.zeros((730, 650, 3), dtype=np.uint8)
+controls_img = np.zeros((780, 680, 3), dtype=np.uint8)
 y_offset = 30
 
 for key_text, action_text in controls_data:
@@ -323,7 +425,7 @@ while True:
             display_img = cv2.cvtColor(combined_mask, cv2.COLOR_GRAY2BGR)
         else:
             display_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            if selected_labels:
+            if np.any(combined_mask > 0):
                 red_overlay = display_img.copy()
                 red_overlay[combined_mask > 0] = [0, 0, 255]
                 blended_red = cv2.addWeighted(display_img, 0.8, red_overlay, 0.2, 0)
@@ -348,10 +450,19 @@ while True:
     M = np.array([[zoom_level, 0, -view_x * zoom_level], [0, zoom_level, -view_y * zoom_level]], dtype=np.float32)
     view = cv2.warpAffine(display_img, M, (VIEW_W, VIEW_H), flags=cv2.INTER_NEAREST)
 
-    has_active_edits = (current_idx in slice_cuts) or (current_idx in slice_adds) or drawing_cut or drawing_add
+    has_active_edits = (
+        (current_idx in slice_cuts)
+        or (current_idx in slice_adds)
+        or (current_idx in interpolated_slices)
+        or drawing_cut
+        or drawing_add
+    )
     text_color_1 = (0, 0, 255) if has_active_edits else (255, 255, 255)
+    mode_label = "MASK" if pure_mask_view else "OVERLAY"
+    if current_idx in interpolated_slices:
+        mode_label += " [INTERP]"
 
-    status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {'MASK' if pure_mask_view else 'OVERLAY'}"
+    status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {mode_label}"
     status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked} | Persist: {'ON' if persistent_edits else 'OFF'}"
     cv2.putText(view, status_1, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color_1, 1)
     cv2.putText(view, status_2, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if params_locked else (255, 255, 255), 1)
@@ -422,23 +533,28 @@ while True:
                 z_min = 0
                 z_max = len(image_files) - 1
 
-                # prevent cross-contamination between datasets
+                # Prevent cross-contamination between datasets
                 slice_cuts.clear()
                 slice_adds.clear()
                 slice_approved_masks.clear()
+                keyframes.clear()
+                interpolated_slices.clear()
                 
                 load_current_image()
                 print(f"\n--- Switched to Dataset: {dataset_name} ---")
 
     elif key == ord("v"):
         z_min = current_idx
+        needs_redraw = True
         print(f"Start bound set to slice {z_min+1}")
     elif key == ord("b"):
         z_max = current_idx
+        needs_redraw = True
         print(f"End bound set to slice {z_max+1}")
     elif key == ord("x"):
         z_min = 0
         z_max = len(image_files) - 1
+        needs_redraw = True
         print(f"Bounds reset to full volume: 1 to {len(image_files)}")
     elif key == ord("j"):
         prev = current_idx
@@ -460,13 +576,41 @@ while True:
         user_adds.fill(0)
         if current_idx in slice_cuts: del slice_cuts[current_idx]
         if current_idx in slice_adds: del slice_adds[current_idx]
+        slice_approved_masks.pop(current_idx, None)
+        keyframes.discard(current_idx)
+        interpolated_slices.discard(current_idx)
         recompute_components()
         invalidate_future_caches()
+    elif key == ord("i"):
+        # Scan backward to find the closest user keyframe with a valid selection
+        prev_idx = None
+        for p in range(current_idx - 1, -1, -1):
+            if p in keyframes and p in slice_approved_masks:
+                prev_idx = p
+                break
+        # Fallback to the earliest approved slice if no explicit keyframe exists behind current_idx
+        if prev_idx is None:
+            for p in range(current_idx - 1, -1, -1):
+                if p in slice_approved_masks:
+                    prev_idx = p
+                    break
+        
+        if prev_idx is not None and current_idx in slice_approved_masks:
+            print(f"Interpolating rigid tunnel from slice {prev_idx+1} to {current_idx+1}...")
+            keyframes.add(prev_idx)
+            keyframes.add(current_idx)
+            interpolate_gap(prev_idx, current_idx)
+            print("Interpolation complete. Scroll back with 'h' to inspect.")
+            needs_redraw = True
+        else:
+            print("Error: Ensure you have an active selection on this slice AND a previous keyframe slice.")
+
     elif key == ord("u"):
         user_cuts.fill(0)
         user_adds.fill(0)
         if current_idx in slice_cuts: del slice_cuts[current_idx]
         if current_idx in slice_adds: del slice_adds[current_idx]
+        interpolated_slices.discard(current_idx)
         recompute_components()
         invalidate_future_caches()
     elif key == ord("r"):
