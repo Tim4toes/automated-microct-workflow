@@ -10,9 +10,9 @@ tk_root = tk.Tk()
 tk_root.withdraw()
 
 # 1. Define initial input directory
-input_dir = r"F:\automated-microct-workflow\3_workflow\annotation_testing\input_data\dataset1_sost"
+input_dir = r"D:\automated-microct-workflow\3_workflow\annotation_testing\input_data\dataset1_sost"
 dataset_name = os.path.basename(os.path.normpath(input_dir))
-output_dir = os.path.join(r"F:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks", dataset_name)
+output_dir = os.path.join(r"D:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks", dataset_name)
 
 # 2. Discover images
 valid_exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
@@ -33,6 +33,7 @@ z_max = len(image_files) - 1
 
 slice_cuts = {}            
 slice_adds = {}
+slice_vents = {}             # NEW: Tracks venting scalpels (applied before fill)
 slice_approved_masks = {}  
 keyframes = set()            # Tracks slices where user explicitly clicked/edited/interpolated
 interpolated_slices = set()  # Protects rigid SDF tunnel masks from being overwritten by Otsu
@@ -43,6 +44,7 @@ num_labels = 0
 selected_labels = set()
 user_cuts = None
 user_adds = None
+user_vents = None            # NEW: Active slice venting scalpels
 pure_mask_view = False
 
 # Drawing state
@@ -50,6 +52,8 @@ drawing_cut = False
 last_cut_pt = None
 drawing_add = False
 last_add_pt = None
+drawing_vent = False         # NEW: Vent drawing state
+last_vent_pt = None
 
 # Interactive parameters
 live_dilation_iters = 0     
@@ -79,6 +83,7 @@ def save_workspace():
     # Cast arrays to booleans (True/False) to cut RAM and file size by 87.5%
     for k, v in slice_cuts.items(): save_dict[f"cut_{k}"] = v.astype(np.bool_)
     for k, v in slice_adds.items(): save_dict[f"add_{k}"] = v.astype(np.bool_)
+    for k, v in slice_vents.items(): save_dict[f"vent_{k}"] = v.astype(np.bool_)
     for k, v in slice_approved_masks.items(): save_dict[f"mask_{k}"] = v.astype(np.bool_)
     
     # Save metadata for keyframes, interpolated regions, and bounds
@@ -90,9 +95,10 @@ def save_workspace():
     print(f"\n--- Workspace successfully saved to {session_file} ---")
 
 def load_workspace():
-    global slice_cuts, slice_adds, slice_approved_masks, keyframes, interpolated_slices, z_min, z_max, is_reversed
+    global slice_cuts, slice_adds, slice_vents, slice_approved_masks, keyframes, interpolated_slices, z_min, z_max, is_reversed
     slice_cuts.clear()
     slice_adds.clear()
+    slice_vents.clear()
     slice_approved_masks.clear()
     keyframes.clear()
     interpolated_slices.clear()
@@ -130,12 +136,14 @@ def load_workspace():
             
             if key.startswith("cut_"): slice_cuts[idx] = restored_array
             elif key.startswith("add_"): slice_adds[idx] = restored_array
+            elif key.startswith("vent_"): slice_vents[idx] = restored_array
             elif key.startswith("mask_"): slice_approved_masks[idx] = restored_array
             
         # Backward compatibility: if loading an older workspace without keyframe metadata
         if not keyframes:
             keyframes.update(slice_cuts.keys())
             keyframes.update(slice_adds.keys())
+            keyframes.update(slice_vents.keys())
             if 0 in slice_approved_masks:
                 keyframes.add(0)
                 
@@ -153,23 +161,27 @@ def get_overlapping_labels(target_labels_array, reference_mask):
     unique_labels.discard(0) 
     return unique_labels
 
-def generate_raw_components(image_array, cuts_array, adds_array):
+def generate_raw_components(image_array, cuts_array, adds_array, vents_array):
     _, thresh = cv2.threshold(image_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
     # 1. Apply user bridges FIRST, closing outer gaps before contour detection
     thresh[adds_array > 0] = 255
     
+    # 2. Apply venting scalpels BEFORE filling to pop massive cavities
+    thresh[vents_array > 0] = 0
+    
     if live_dilation_iters > 0:
         kernel = np.ones((3, 3), np.uint8)
         thresh = cv2.dilate(thresh, kernel, iterations=live_dilation_iters)
     
-    # 2. Find external contours. Because gaps are now bridged, internal holes will be filled automatically.
+    # 3. Find external contours. Because gaps are now bridged, internal holes will be filled automatically.
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filled = np.zeros_like(thresh)
     cv2.drawContours(filled, contours, -1, 255, -1)
     
-    # 3. Apply scalpel cuts LAST so they cleanly sever the filled bone segments
+    # 4. Apply scalpel cuts LAST so they cleanly sever the filled bone segments, re-apply vents for clean cuts
     filled[cuts_array > 0] = 0    
+    filled[vents_array > 0] = 0    
     return cv2.connectedComponents(filled, connectivity=4)
 
 def update_approved_mask():
@@ -193,7 +205,7 @@ def invalidate_future_caches():
 
 def recompute_components(auto_select_from_mask=None):
     global labels, num_labels, selected_labels, combined_mask, needs_redraw
-    num_labels, labels = generate_raw_components(img, user_cuts, user_adds)
+    num_labels, labels = generate_raw_components(img, user_cuts, user_adds, user_vents)
     
     # If this slice holds a rigid interpolated mask, preserve it until edited
     if current_idx in interpolated_slices and current_idx in slice_approved_masks:
@@ -209,6 +221,7 @@ def recompute_components(auto_select_from_mask=None):
     elif selected_labels and combined_mask is not None:
         ref_mask = combined_mask.copy()
         ref_mask[user_cuts > 0] = 0
+        ref_mask[user_vents > 0] = 0
         selected_labels = get_overlapping_labels(labels, ref_mask)
     else:
         selected_labels = set()
@@ -246,9 +259,10 @@ def interpolate_gap(start_idx, end_idx):
         # Clear legacy manual edits in the gap so they do not conflict
         if target_idx in slice_cuts: del slice_cuts[target_idx]
         if target_idx in slice_adds: del slice_adds[target_idx]
+        if target_idx in slice_vents: del slice_vents[target_idx]
 
 def load_current_image(propagate_from=None):
-    global img, image_name, user_cuts, user_adds, selected_labels
+    global img, image_name, user_cuts, user_adds, user_vents, selected_labels
     image_name = image_files[current_idx]
     img = cv2.imread(os.path.join(input_dir, image_name), cv2.IMREAD_GRAYSCALE)
     
@@ -268,9 +282,17 @@ def load_current_image(propagate_from=None):
             else:
                 slice_adds[current_idx] = slice_adds[propagate_from].copy()
             persisted_change = True
+
+        if propagate_from in slice_vents:
+            if current_idx in slice_vents:
+                slice_vents[current_idx] = cv2.bitwise_or(slice_vents[current_idx], slice_vents[propagate_from])
+            else:
+                slice_vents[current_idx] = slice_vents[propagate_from].copy()
+            persisted_change = True
                 
     user_cuts = slice_cuts.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     user_adds = slice_adds.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
+    user_vents = slice_vents.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     
     ref_mask = None
     if persisted_change and propagate_from in slice_approved_masks:
@@ -299,8 +321,8 @@ def screen_to_img(x, y):
     return max(0, min(ix, img.shape[1] - 1)), max(0, min(iy, img.shape[0] - 1))
 
 def mouse_click(event, x, y, flags, param):
-    global drawing_cut, last_cut_pt, drawing_add, last_add_pt, is_panning, last_pan_pt
-    global zoom_level, view_x, view_y, needs_redraw
+    global drawing_cut, last_cut_pt, drawing_add, last_add_pt, drawing_vent, last_vent_pt
+    global is_panning, last_pan_pt, zoom_level, view_x, view_y, needs_redraw
 
     ix, iy = screen_to_img(x, y)
 
@@ -343,7 +365,11 @@ def mouse_click(event, x, y, flags, param):
 
     elif event == cv2.EVENT_RBUTTONDOWN:
         interpolated_slices.discard(current_idx)
-        if flags & cv2.EVENT_FLAG_SHIFTKEY:
+        if flags & cv2.EVENT_FLAG_CTRLKEY:
+            drawing_vent = True
+            last_vent_pt = (ix, iy)
+            user_vents[iy, ix] = 255
+        elif flags & cv2.EVENT_FLAG_SHIFTKEY:
             drawing_add = True
             last_add_pt = (ix, iy)
             user_adds[iy, ix] = 255
@@ -362,6 +388,10 @@ def mouse_click(event, x, y, flags, param):
             cv2.line(user_adds, last_add_pt, (ix, iy), 255, thickness=1)
             last_add_pt = (ix, iy)
             needs_redraw = True
+        elif drawing_vent and last_vent_pt is not None:
+            cv2.line(user_vents, last_vent_pt, (ix, iy), 255, thickness=1)
+            last_vent_pt = (ix, iy)
+            needs_redraw = True
             
     elif event == cv2.EVENT_RBUTTONUP:
         if drawing_cut:
@@ -376,6 +406,12 @@ def mouse_click(event, x, y, flags, param):
             if np.any(user_adds > 0):
                 slice_adds[current_idx] = user_adds.copy()
                 keyframes.add(current_idx)
+        if drawing_vent:
+            drawing_vent = False
+            last_vent_pt = None
+            if np.any(user_vents > 0):
+                slice_vents[current_idx] = user_vents.copy()
+                keyframes.add(current_idx)
                 
         recompute_components()
         invalidate_future_caches()
@@ -388,8 +424,9 @@ controls_data = [
     ("=== MICRO-CT SEGMENTATION CONTROLS ===", ""),
     ("", ""),
     ("Left Click", "Select / Unselect a bone plate"),
-    ("Right Click & Drag", "Draw 'scalpel' line to sever a bridging suture"),
-    ("Shift + Right Click", "Draw 'bridge' line to fill gaps/connect bones"),
+    ("Right Click & Drag", "Draw standard 'scalpel' (White) to sever a suture"),
+    ("Ctrl + Right Click", "Draw 'venting scalpel' (Cyan) to pop massive cavities BEFORE fill"),
+    ("Shift + Right Click", "Draw 'bridge' line (Green) to fill gaps/connect bones"),
     ("Scroll Wheel", "Zoom in/out"),
     ("Middle Click & Drag", "Pan image"),
     ("", ""),
@@ -416,7 +453,7 @@ controls_data = [
     ("'q'", "Quit")
 ]
 
-controls_img = np.zeros((780, 680, 3), dtype=np.uint8)
+controls_img = np.zeros((810, 750, 3), dtype=np.uint8)
 y_offset = 30
 
 for key_text, action_text in controls_data:
@@ -424,7 +461,7 @@ for key_text, action_text in controls_data:
         cv2.putText(controls_img, key_text, (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     else:
         cv2.putText(controls_img, key_text, (15, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-        cv2.putText(controls_img, action_text, (230, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        cv2.putText(controls_img, action_text, (240, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
     y_offset += 25
 
 cv2.imshow("Controls Menu", controls_img)
@@ -470,6 +507,13 @@ while True:
                 blended_cut = cv2.addWeighted(display_img, 0.8, cut_overlay, 0.2, 0)
                 display_img[user_cuts > 0] = blended_cut[user_cuts > 0]
 
+            # 20% Opacity Cyan for Venting Scalpels
+            if np.any(user_vents > 0):
+                vent_overlay = display_img.copy()
+                vent_overlay[user_vents > 0] = [255, 255, 0] # Cyan in BGR
+                blended_vent = cv2.addWeighted(display_img, 0.8, vent_overlay, 0.2, 0)
+                display_img[user_vents > 0] = blended_vent[user_vents > 0]
+
         needs_redraw = False
 
     M = np.array([[zoom_level, 0, -view_x * zoom_level], [0, zoom_level, -view_y * zoom_level]], dtype=np.float32)
@@ -478,9 +522,11 @@ while True:
     has_active_edits = (
         (current_idx in slice_cuts)
         or (current_idx in slice_adds)
+        or (current_idx in slice_vents)
         or (current_idx in interpolated_slices)
         or drawing_cut
         or drawing_add
+        or drawing_vent
     )
     text_color_1 = (0, 0, 255) if has_active_edits else (255, 255, 255)
     mode_label = "MASK" if pure_mask_view else "OVERLAY"
@@ -525,7 +571,8 @@ while True:
                 temp_img = cv2.imread(os.path.join(input_dir, image_files[i]), cv2.IMREAD_GRAYSCALE)
                 c_array = slice_cuts.get(i, np.zeros(IMAGE_SHAPE, dtype=np.uint8))
                 a_array = slice_adds.get(i, np.zeros(IMAGE_SHAPE, dtype=np.uint8))
-                _, temp_labels = generate_raw_components(temp_img, c_array, a_array)
+                v_array = slice_vents.get(i, np.zeros(IMAGE_SHAPE, dtype=np.uint8))
+                _, temp_labels = generate_raw_components(temp_img, c_array, a_array, v_array)
                 temp_sel = get_overlapping_labels(temp_labels, last_valid_mask)
                 raw_mask = (np.isin(temp_labels, list(temp_sel)) * 255).astype(np.uint8)
                 # CRITICAL: Do NOT save raw_mask to slice_approved_masks here, or RAM will explode
@@ -553,6 +600,7 @@ while True:
             
         slice_cuts = remap_dict(slice_cuts)
         slice_adds = remap_dict(slice_adds)
+        slice_vents = remap_dict(slice_vents)
         slice_approved_masks = remap_dict(slice_approved_masks)
         
         keyframes = set((total - 1 - k) for k in keyframes)
@@ -570,7 +618,7 @@ while True:
         if new_dir:
             input_dir = new_dir
             dataset_name = os.path.basename(os.path.normpath(input_dir))
-            output_dir = os.path.join(r"F:\automated-microct-workflow\3_workflow\annotation_testing\cc_masks", dataset_name)
+            output_dir = os.path.join(r"D:utomated-microct-workflow\3_workflow\annotation_testing\cc_masks", dataset_name)
             
             image_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(valid_exts)])
             if not image_files:
@@ -589,6 +637,7 @@ while True:
                 # Prevent cross-contamination between datasets
                 slice_cuts.clear()
                 slice_adds.clear()
+                slice_vents.clear()
                 slice_approved_masks.clear()
                 keyframes.clear()
                 interpolated_slices.clear()
@@ -629,8 +678,10 @@ while True:
             combined_mask.fill(0)
         user_cuts.fill(0)
         user_adds.fill(0)
+        user_vents.fill(0)
         if current_idx in slice_cuts: del slice_cuts[current_idx]
         if current_idx in slice_adds: del slice_adds[current_idx]
+        if current_idx in slice_vents: del slice_vents[current_idx]
         slice_approved_masks.pop(current_idx, None)
         keyframes.discard(current_idx)
         interpolated_slices.discard(current_idx)
@@ -666,8 +717,10 @@ while True:
     elif key == ord("u"):
         user_cuts.fill(0)
         user_adds.fill(0)
+        user_vents.fill(0)
         if current_idx in slice_cuts: del slice_cuts[current_idx]
         if current_idx in slice_adds: del slice_adds[current_idx]
+        if current_idx in slice_vents: del slice_vents[current_idx]
         interpolated_slices.discard(current_idx)
         recompute_components()
         invalidate_future_caches()
