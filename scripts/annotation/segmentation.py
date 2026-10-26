@@ -56,6 +56,7 @@ live_dilation_iters = 0
 export_dilation_iters = 1   
 params_locked = True
 persistent_edits = False    # Toggles automatic carry-over of cuts/bridges
+is_reversed = False         # Tracks if dataset Z-axis is flipped
 
 # Rendering variables
 needs_redraw = True
@@ -72,7 +73,8 @@ last_pan_pt = None
 def save_workspace():
     os.makedirs(output_dir, exist_ok=True)
     session_file = os.path.join(output_dir, f"{dataset_name}_workspace.npz")
-    save_dict = {}
+    # Save direction state alongside arrays
+    save_dict = {"is_reversed": np.array(is_reversed)}
     
     # Cast arrays to booleans (True/False) to cut RAM and file size by 87.5%
     for k, v in slice_cuts.items(): save_dict[f"cut_{k}"] = v.astype(np.bool_)
@@ -88,7 +90,7 @@ def save_workspace():
     print(f"\n--- Workspace successfully saved to {session_file} ---")
 
 def load_workspace():
-    global slice_cuts, slice_adds, slice_approved_masks, keyframes, interpolated_slices, z_min, z_max
+    global slice_cuts, slice_adds, slice_approved_masks, keyframes, interpolated_slices, z_min, z_max, is_reversed
     slice_cuts.clear()
     slice_adds.clear()
     slice_approved_masks.clear()
@@ -99,8 +101,19 @@ def load_workspace():
     
     if os.path.exists(session_file):
         data = np.load(session_file)
+
+        # Align dataset physical direction with the saved workspace state
+        if "is_reversed" in data.files:
+            saved_rev = bool(data["is_reversed"])
+            if saved_rev != is_reversed:
+                is_reversed = saved_rev
+                image_files.reverse()
+
         for key in data.files:
-            if key == "meta_keyframes":
+            # FIX 1: Skip "is_reversed" so key.split('_')[1] does not crash with ValueError
+            if key == "is_reversed":
+                continue
+            elif key == "meta_keyframes":
                 keyframes.update(data[key].tolist())
                 continue
             elif key == "meta_interpolated":
@@ -189,10 +202,16 @@ def recompute_components(auto_select_from_mask=None):
         needs_redraw = True
         return
 
+    # FIX 2: Re-project from spatial mask instead of raw label integers so cuts/bridges
+    # do not shift component IDs to unrelated bone islands
     if auto_select_from_mask is not None:
         selected_labels = get_overlapping_labels(labels, auto_select_from_mask)
+    elif selected_labels and combined_mask is not None:
+        ref_mask = combined_mask.copy()
+        ref_mask[user_cuts > 0] = 0
+        selected_labels = get_overlapping_labels(labels, ref_mask)
     else:
-        selected_labels = {l for l in selected_labels if l < num_labels}
+        selected_labels = set()
         
     update_approved_mask()
     needs_redraw = True
@@ -233,25 +252,30 @@ def load_current_image(propagate_from=None):
     image_name = image_files[current_idx]
     img = cv2.imread(os.path.join(input_dir, image_name), cv2.IMREAD_GRAYSCALE)
     
-    # MERGE cuts and bridges from the previous slice if Persistent Mode is ON
+    # FIX 5: Track if persistent edits modified the target slice so selection propagates cleanly
+    persisted_change = False
     if persistent_edits and propagate_from is not None and current_idx not in interpolated_slices:
         if propagate_from in slice_cuts:
             if current_idx in slice_cuts:
                 slice_cuts[current_idx] = cv2.bitwise_or(slice_cuts[current_idx], slice_cuts[propagate_from])
             else:
                 slice_cuts[current_idx] = slice_cuts[propagate_from].copy()
+            persisted_change = True
                 
         if propagate_from in slice_adds:
             if current_idx in slice_adds:
                 slice_adds[current_idx] = cv2.bitwise_or(slice_adds[current_idx], slice_adds[propagate_from])
             else:
                 slice_adds[current_idx] = slice_adds[propagate_from].copy()
+            persisted_change = True
                 
     user_cuts = slice_cuts.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     user_adds = slice_adds.get(current_idx, np.zeros(IMAGE_SHAPE, dtype=np.uint8)).copy()
     
     ref_mask = None
-    if current_idx in slice_approved_masks:
+    if persisted_change and propagate_from in slice_approved_masks:
+        ref_mask = slice_approved_masks[propagate_from]
+    elif current_idx in slice_approved_masks:
         ref_mask = slice_approved_masks[current_idx]
     elif propagate_from is not None and propagate_from in slice_approved_masks:
         ref_mask = slice_approved_masks[propagate_from]
@@ -382,7 +406,8 @@ controls_data = [
     ("", ""),
     ("'u'", "Undo SCALPEL & BRIDGES only on this slice"),
     ("'p'", "Toggle PERSISTENT edits (auto-copy to next slice)"),
-    ("'i'", "INTERPOLATE regions from previous keyframe"),
+    ("'i'", "INTERPOLATE regions from previous approved slice"),
+    ("'f'", "FLIP Z-direction (Reverse dataset processing order)"),
     ("'c'", "Clear BOTH selections and cuts on this slice"),
     ("'r'", "Reset camera zoom and pan"),
     ("'m'", "Toggle Pure Mask View"),
@@ -462,7 +487,7 @@ while True:
     if current_idx in interpolated_slices:
         mode_label += " [INTERP]"
 
-    status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Mode: {mode_label}"
+    status_1 = f"[{current_idx+1}/{len(image_files)}] {image_name} | BOUNDS: {z_min+1} to {z_max+1} | Rev: {'YES' if is_reversed else 'NO'} | Mode: {mode_label}"
     status_2 = f"Live Dil: {live_dilation_iters}px | Export Dil: {export_dilation_iters}px | Locked: {params_locked} | Persist: {'ON' if persistent_edits else 'OFF'}"
     cv2.putText(view, status_1, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color_1, 1)
     cv2.putText(view, status_2, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if params_locked else (255, 255, 255), 1)
@@ -478,7 +503,8 @@ while True:
         load_current_image()    
         
     elif key == ord("e"):
-        print(f"\n--- Starting Batch Export (Slices {z_min+1} to {z_max+1}) ---")
+        start_b, end_b = min(z_min, z_max), max(z_min, z_max)
+        print(f"\n--- Starting Batch Export (Slices {start_b+1} to {end_b+1}) ---")
         os.makedirs(output_dir, exist_ok=True)
         last_valid_mask = None
         
@@ -489,7 +515,7 @@ while True:
         for i in range(len(image_files)):
             out_path = os.path.join(output_dir, os.path.splitext(image_files[i])[0] + ".bmp")
             
-            if i < z_min or i > z_max:
+            if i < start_b or i > end_b:
                 Image.fromarray(empty_mask).convert('1').save(out_path)
                 continue
                 
@@ -504,17 +530,40 @@ while True:
                 raw_mask = (np.isin(temp_labels, list(temp_sel)) * 255).astype(np.uint8)
                 # CRITICAL: Do NOT save raw_mask to slice_approved_masks here, or RAM will explode
             
+            # FIX 3: Keep last_valid_mask un-dilated for accurate slice-to-slice propagation
             last_valid_mask = raw_mask.copy()
+            export_mask = raw_mask.copy()
             
             if export_kernel is not None:
-                last_valid_mask = cv2.dilate(last_valid_mask, export_kernel, iterations=export_dilation_iters)
+                export_mask = cv2.dilate(export_mask, export_kernel, iterations=export_dilation_iters)
                 
-            Image.fromarray(last_valid_mask).convert('1').save(out_path)
+            Image.fromarray(export_mask).convert('1').save(out_path)
             if i % 50 == 0:
                 print(f"Exported {i+1}/{len(image_files)}...")
                 
         print("--- Batch Export Complete! ---\n")
         
+    elif key == ord("f"):
+        is_reversed = not is_reversed
+        total = len(image_files)
+        image_files.reverse()
+        
+        def remap_dict(d):
+            return {(total - 1 - k): v for k, v in d.items()}
+            
+        slice_cuts = remap_dict(slice_cuts)
+        slice_adds = remap_dict(slice_adds)
+        slice_approved_masks = remap_dict(slice_approved_masks)
+        
+        keyframes = set((total - 1 - k) for k in keyframes)
+        interpolated_slices = set((total - 1 - k) for k in interpolated_slices)
+        
+        current_idx = total - 1 - current_idx
+        z_min, z_max = total - 1 - z_max, total - 1 - z_min
+        
+        load_current_image()
+        print(f"\n--- Dataset Z-direction flipped (Reversed: {is_reversed}) ---")
+    
     elif key == ord("o"):
         new_dir = filedialog.askdirectory(initialdir=os.path.dirname(input_dir), title="Select New Dataset Folder")
         
@@ -532,6 +581,10 @@ while True:
                 current_idx = 0
                 z_min = 0
                 z_max = len(image_files) - 1
+                
+                # FIX 4: Reset direction and persistent state for the newly loaded dataset
+                is_reversed = False
+                persistent_edits = False
 
                 # Prevent cross-contamination between datasets
                 slice_cuts.clear()
@@ -572,6 +625,8 @@ while True:
         needs_redraw = True    
     elif key == ord("c"):
         selected_labels.clear()
+        if combined_mask is not None:
+            combined_mask.fill(0)
         user_cuts.fill(0)
         user_adds.fill(0)
         if current_idx in slice_cuts: del slice_cuts[current_idx]
@@ -596,12 +651,15 @@ while True:
                     break
         
         if prev_idx is not None and current_idx in slice_approved_masks:
-            print(f"Interpolating rigid tunnel from slice {prev_idx+1} to {current_idx+1}...")
-            keyframes.add(prev_idx)
-            keyframes.add(current_idx)
-            interpolate_gap(prev_idx, current_idx)
-            print("Interpolation complete. Scroll back with 'h' to inspect.")
-            needs_redraw = True
+            if current_idx - prev_idx <= 1:
+                print("Notice: Selected keyframes are adjacent; no intermediate slices to interpolate.")
+            else:
+                print(f"Interpolating rigid tunnel from slice {prev_idx+1} to {current_idx+1}...")
+                keyframes.add(prev_idx)
+                keyframes.add(current_idx)
+                interpolate_gap(prev_idx, current_idx)
+                print("Interpolation complete. Scroll back with 'h' to inspect.")
+                needs_redraw = True
         else:
             print("Error: Ensure you have an active selection on this slice AND a previous keyframe slice.")
 
@@ -619,9 +677,16 @@ while True:
         params_locked = not params_locked
         needs_redraw = True
     elif key == ord("]"):
-        if not params_locked: live_dilation_iters += 1; recompute_components()
+        # FIX 6: Invalidate downstream caches when live dilation changes
+        if not params_locked:
+            live_dilation_iters += 1
+            recompute_components()
+            invalidate_future_caches()
     elif key == ord("["):
-        if not params_locked: live_dilation_iters = max(0, live_dilation_iters - 1); recompute_components()
+        if not params_locked:
+            live_dilation_iters = max(0, live_dilation_iters - 1)
+            recompute_components()
+            invalidate_future_caches()
     elif key == ord("}"):
         if not params_locked: export_dilation_iters += 1; needs_redraw = True
     elif key == ord("{"):
