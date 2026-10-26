@@ -161,12 +161,15 @@ you must ensure PyTorch is installed with the correct CUDA toolkit matching your
 
 If the script defaults to CPU or you encounter CUDA errors, uninstall the default PyTorch:
 
+```bash
 pip uninstall torch
+```
 
 Then, visit the PyTorch Get Started page to generate the specific installation command for your system's CUDA version. 
 A typical command for Windows with CUDA 11.8 or 12.1 looks like this:
-
+```bash
 pip install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
+```
 
 To find Cuda version, run nvidia-smi into Wndows cmd
 
