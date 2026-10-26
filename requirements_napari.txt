@@ -1,0 +1,11 @@
+# Core GUI and Image Viewer
+napari[all]
+
+# Image processing and array handling (Required for the memory-saver script)
+opencv-python
+numpy
+
+# Interactive Segmentation Plugin
+# (Uncomment or adjust this depending on the exact name of your local fork/plugin)
+
+napari-nnunet
