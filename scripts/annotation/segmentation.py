@@ -74,6 +74,14 @@ last_pan_pt = None
 
 # --- Workspace Management ---
 
+def on_trackbar_change(val):
+    global current_idx
+    # Only load if the value actually changed (prevents lag loops)
+    if val != current_idx:
+        prev = current_idx
+        current_idx = val
+        load_current_image(propagate_from=prev)
+
 def save_workspace():
     os.makedirs(output_dir, exist_ok=True)
     session_file = os.path.join(output_dir, f"{dataset_name}_workspace.npz")
@@ -469,6 +477,11 @@ cv2.imshow("Controls Menu", controls_img)
 # Main Viewer Window
 window_name = "Volumetric CC Editor"
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+
+# Create the trackbar attached to your main window
+total_slices = len(image_files)
+cv2.createTrackbar("Slice", window_name, current_idx, total_slices - 1, on_trackbar_change)
+
 cv2.resizeWindow(window_name, VIEW_W, VIEW_H)
 cv2.setMouseCallback(window_name, mouse_click)
 
@@ -661,10 +674,12 @@ while True:
     elif key == ord("j"):
         prev = current_idx
         current_idx = (current_idx + 1) % len(image_files)
+        cv2.setTrackbarPos("Slice", window_name, current_idx)
         load_current_image(propagate_from=prev)
     elif key == ord("h"):
         prev = current_idx
         current_idx = (current_idx - 1) % len(image_files)
+        cv2.setTrackbarPos("Slice", window_name, current_idx)
         load_current_image(propagate_from=prev)
     elif key == ord("m"):
         pure_mask_view = not pure_mask_view
